@@ -180,7 +180,8 @@ func main() {
 		cronController := newCronController(project.Name, bridge)
 		cronController.start()
 		defer cronController.stop()
-		controlURL, err := startCronControlServer(ctx, cronControlListen, bridgeToken, cronController)
+		sender := &deliverySender{}
+		controlURL, err := startCronControlServer(ctx, cronControlListen, bridgeToken, cronController, sender)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "project %q cron control: %v\n", project.Name, err)
 			os.Exit(2)
@@ -220,6 +221,7 @@ func main() {
 				os.Exit(2)
 			}
 			platforms = append(platforms, platform)
+			sender.register(platform)
 		}
 	}
 	<-ctx.Done()

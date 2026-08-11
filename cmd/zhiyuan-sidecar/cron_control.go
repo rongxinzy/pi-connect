@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chenhg5/cc-connect/core"
 	"github.com/robfig/cron/v3"
 )
 
@@ -31,6 +32,52 @@ type cronTaskRequest struct {
 	TaskID          string       `json:"taskId"`
 	ScheduleVersion string       `json:"scheduleVersion"`
 	Schedule        cronSchedule `json:"schedule"`
+}
+
+// deliveryRequest contains only a resolved outbound target and final text.
+// It deliberately excludes prompts, tool inputs, and arbitrary commands.
+type deliveryRequest struct {
+	Platform   string `json:"platform"`
+	SessionKey string `json:"sessionKey"`
+	Content    string `json:"content"`
+}
+
+type deliverySender struct {
+	mu        sync.RWMutex
+	platforms map[string]core.Platform
+}
+
+func (s *deliverySender) register(platform core.Platform) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.platforms == nil {
+		s.platforms = make(map[string]core.Platform)
+	}
+	s.platforms[platform.Name()] = platform
+}
+
+func (s *deliverySender) send(request deliveryRequest) error {
+	if strings.TrimSpace(request.Platform) == "" || strings.TrimSpace(request.SessionKey) == "" || strings.TrimSpace(request.Content) == "" {
+		return errors.New("platform, sessionKey, and content are required")
+	}
+	s.mu.RLock()
+	platform := s.platforms[request.Platform]
+	s.mu.RUnlock()
+	if platform == nil {
+		return errors.New("configured platform is unavailable")
+	}
+	reconstructor, ok := platform.(core.ReplyContextReconstructor)
+	if !ok {
+		return errors.New("platform does not support proactive delivery")
+	}
+	replyCtx, err := reconstructor.ReconstructReplyCtx(request.SessionKey)
+	if err != nil {
+		return fmt.Errorf("resolve delivery target: %w", err)
+	}
+	if err := platform.Send(context.Background(), replyCtx, request.Content); err != nil {
+		return fmt.Errorf("send delivery: %w", err)
+	}
+	return nil
 }
 
 // cronSchedule is a trigger-only schedule description. It deliberately has
@@ -232,7 +279,7 @@ func (b *bridgeClient) triggerCron(
 	return nil
 }
 
-func startCronControlServer(ctx context.Context, rawAddress, token string, controller *cronController) (string, error) {
+func startCronControlServer(ctx context.Context, rawAddress, token string, controller *cronController, sender *deliverySender) (string, error) {
 	address := strings.TrimSpace(rawAddress)
 	host, _, err := net.SplitHostPort(address)
 	if err != nil || !isLoopbackHost(host) {
@@ -246,7 +293,7 @@ func startCronControlServer(ctx context.Context, rawAddress, token string, contr
 		listener.Close()
 		return "", errors.New("cron control token is required")
 	}
-	server := &http.Server{Handler: cronControlHandler(token, controller), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: cronControlHandler(token, controller, sender), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -257,13 +304,14 @@ func startCronControlServer(ctx context.Context, rawAddress, token string, contr
 	return "http://" + listener.Addr().String(), nil
 }
 
-func cronControlHandler(token string, controller *cronController) http.Handler {
+func cronControlHandler(token string, controller *cronController, sender *deliverySender) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if !secureBearerMatch(request.Header.Get("Authorization"), token) {
 			response.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		const taskPath = "/v1/cc-connect/cron/tasks"
+		const deliveryPath = "/v1/cc-connect/deliver"
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/cc-connect/cron/health":
 			response.WriteHeader(http.StatusNoContent)
@@ -276,6 +324,23 @@ func cronControlHandler(token string, controller *cronController) http.Handler {
 				return
 			}
 			if err := controller.upsert(payload); err != nil {
+				http.Error(response, err.Error(), http.StatusBadRequest)
+				return
+			}
+			response.WriteHeader(http.StatusNoContent)
+		case request.Method == http.MethodPost && request.URL.Path == deliveryPath:
+			if sender == nil {
+				http.Error(response, "delivery is unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			decoder := json.NewDecoder(io.LimitReader(request.Body, 64<<10))
+			decoder.DisallowUnknownFields()
+			var payload deliveryRequest
+			if err := decoder.Decode(&payload); err != nil || decoder.More() {
+				http.Error(response, "invalid delivery request", http.StatusBadRequest)
+				return
+			}
+			if err := sender.send(payload); err != nil {
 				http.Error(response, err.Error(), http.StatusBadRequest)
 				return
 			}

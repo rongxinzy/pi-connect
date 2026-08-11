@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,7 +11,22 @@ import (
 	"time"
 
 	"github.com/chenhg5/cc-connect/config"
+	"github.com/chenhg5/cc-connect/core"
 )
+
+type deliveryPlatformStub struct{ sent string }
+
+func (p *deliveryPlatformStub) Name() string                             { return "telegram" }
+func (p *deliveryPlatformStub) Start(core.MessageHandler) error          { return nil }
+func (p *deliveryPlatformStub) Reply(context.Context, any, string) error { return nil }
+func (p *deliveryPlatformStub) Send(_ context.Context, _ any, content string) error {
+	p.sent = content
+	return nil
+}
+func (p *deliveryPlatformStub) Stop() error { return nil }
+func (p *deliveryPlatformStub) ReconstructReplyCtx(sessionKey string) (any, error) {
+	return sessionKey, nil
+}
 
 func TestBridgeOnlyAcceptsLoopbackEndpoints(t *testing.T) {
 	for _, raw := range []string{"http://127.0.0.1:3210", "http://[::1]:3210", "https://localhost:3210"} {
@@ -27,7 +43,7 @@ func TestBridgeOnlyAcceptsLoopbackEndpoints(t *testing.T) {
 
 func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 	controller := newCronController("project", &bridgeClient{})
-	handler := cronControlHandler("secret", controller)
+	handler := cronControlHandler("secret", controller, nil)
 
 	unauthorized := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/cron/tasks", nil)
 	unauthorizedResponse := httptest.NewRecorder()
@@ -54,6 +70,30 @@ func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 	handler.ServeHTTP(execResponse, execPayload)
 	if execResponse.Code != http.StatusBadRequest {
 		t.Fatalf("exec payload status = %d", execResponse.Code)
+	}
+}
+
+func TestDeliveryControlUsesOnlyConfiguredProactivePlatform(t *testing.T) {
+	controller := newCronController("project", &bridgeClient{})
+	sender := &deliverySender{}
+	platform := &deliveryPlatformStub{}
+	sender.register(platform)
+	handler := cronControlHandler("secret", controller, sender)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"platform":"telegram","sessionKey":"telegram:42","content":"done"}`))
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || platform.sent != "done" {
+		t.Fatalf("delivery result status=%d content=%q", response.Code, platform.sent)
+	}
+
+	bad := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"platform":"telegram","sessionKey":"telegram:42","content":"done","exec":"whoami"}`))
+	bad.Header.Set("Authorization", "Bearer secret")
+	badResponse := httptest.NewRecorder()
+	handler.ServeHTTP(badResponse, bad)
+	if badResponse.Code != http.StatusBadRequest {
+		t.Fatalf("unknown delivery field status=%d", badResponse.Code)
 	}
 }
 
