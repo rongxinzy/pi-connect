@@ -1031,7 +1031,7 @@ func (c *Config) validateInternal(permissive bool) error {
 		if proj.Agent.Type == "" {
 			return fmt.Errorf("config: %s.agent.type is required", prefix)
 		}
-		if len(proj.Platforms) == 0 && !permissive {
+		if len(proj.Platforms) == 0 && !permissive && !isZhiyuanCronOnlyProject(proj) {
 			return fmt.Errorf("config: %s needs at least one [[projects.platforms]]", prefix)
 		}
 		for j, p := range proj.Platforms {
@@ -1070,6 +1070,17 @@ func (c *Config) validateInternal(permissive bool) error {
 		}
 	}
 	return nil
+}
+
+// isZhiyuanCronOnlyProject permits the deliberately narrow desktop scheduler
+// sidecar. It has no native messaging platform and only emits authenticated
+// clock triggers back to the loopback ZhiYuan bridge.
+func isZhiyuanCronOnlyProject(project ProjectConfig) bool {
+	if strings.TrimSpace(project.Agent.Type) != "zhiyuan-bridge" {
+		return false
+	}
+	listen, _ := project.Agent.Options["cron_control_listen"].(string)
+	return strings.TrimSpace(listen) != ""
 }
 
 func validateDisplayConfig(prefix string, display *DisplayConfig) error {

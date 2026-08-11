@@ -57,6 +57,17 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: `projects[0] needs at least one [[projects.platforms]]`,
 		},
 		{
+			name: "allows a Zhiyuan cron-only sidecar project",
+			cfg: Config{
+				Projects: []ProjectConfig{{
+					Name: "scheduler",
+					Agent: AgentConfig{Type: "zhiyuan-bridge", Options: map[string]any{
+						"cron_control_listen": "127.0.0.1:0",
+					}},
+				}},
+			},
+		},
+		{
 			name: "requires platform type",
 			cfg: Config{
 				Projects: []ProjectConfig{

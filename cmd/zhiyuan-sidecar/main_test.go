@@ -130,3 +130,37 @@ allow_from = ["u1"]
 		t.Fatalf("unexpected project contract: %#v", cfg.Projects)
 	}
 }
+
+func TestZhiyuanSchedulerOnlyConfigContractLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zhiyuan-scheduler-sidecar.toml")
+	contents := `data_dir = "C:\\Users\\test\\AppData\\Local\\ZhiYuanAgent\\cc-connect"
+
+[webhook]
+enabled = false
+
+[bridge]
+enabled = false
+
+[management]
+enabled = false
+
+[[projects]]
+name = "default"
+[projects.agent]
+type = "zhiyuan-bridge"
+[projects.agent.options]
+bridge_url = "http://127.0.0.1:34567"
+bridge_token = "secret"
+cron_control_listen = "127.0.0.1:0"
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load scheduler-only ZhiYuan sidecar contract: %v", err)
+	}
+	if len(cfg.Projects) != 1 || len(cfg.Projects[0].Platforms) != 0 {
+		t.Fatalf("unexpected scheduler-only project contract: %#v", cfg.Projects)
+	}
+}
