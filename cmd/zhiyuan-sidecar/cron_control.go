@@ -245,6 +245,8 @@ func cronControlHandler(token string, controller *cronController) http.Handler {
 		}
 		const taskPath = "/v1/cc-connect/cron/tasks"
 		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/cc-connect/cron/health":
+			response.WriteHeader(http.StatusNoContent)
 		case request.Method == http.MethodPost && request.URL.Path == taskPath:
 			decoder := json.NewDecoder(io.LimitReader(request.Body, 64<<10))
 			decoder.DisallowUnknownFields()

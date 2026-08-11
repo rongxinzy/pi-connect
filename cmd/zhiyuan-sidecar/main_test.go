@@ -36,6 +36,14 @@ func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 		t.Fatalf("unauthorized status = %d", unauthorizedResponse.Code)
 	}
 
+	health := httptest.NewRequest(http.MethodGet, "/v1/cc-connect/cron/health", nil)
+	health.Header.Set("Authorization", "Bearer secret")
+	healthResponse := httptest.NewRecorder()
+	handler.ServeHTTP(healthResponse, health)
+	if healthResponse.Code != http.StatusNoContent {
+		t.Fatalf("health status = %d", healthResponse.Code)
+	}
+
 	execPayload := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/cc-connect/cron/tasks",
