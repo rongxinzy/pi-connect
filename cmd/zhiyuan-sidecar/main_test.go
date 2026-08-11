@@ -145,7 +145,7 @@ enabled = false
 enabled = false
 
 [[projects]]
-name = "default"
+name = "__zhiyuan_scheduler__"
 [projects.agent]
 type = "zhiyuan-bridge"
 [projects.agent.options]
