@@ -32,9 +32,9 @@ const (
 )
 
 type bridgeClient struct {
-	endpoint string
-	token    string
-	client   *http.Client
+	baseURL *url.URL
+	token   string
+	client  *http.Client
 }
 
 func newBridgeClient(rawURL, token string) (*bridgeClient, error) {
@@ -51,8 +51,13 @@ func newBridgeClient(rawURL, token string) (*bridgeClient, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("bridge_token is required")
 	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/cc-connect/turn"
-	return &bridgeClient{endpoint: endpoint.String(), token: token, client: &http.Client{Timeout: defaultTurnTimeout}}, nil
+	return &bridgeClient{baseURL: endpoint, token: token, client: &http.Client{Timeout: defaultTurnTimeout}}, nil
+}
+
+func (b *bridgeClient) endpoint(pathSuffix string) string {
+	endpoint := *b.baseURL
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + pathSuffix
+	return endpoint.String()
 }
 
 func isLoopbackHost(host string) bool {
@@ -82,7 +87,7 @@ func (b *bridgeClient) runTurn(ctx context.Context, project string, msg *core.Me
 	if err != nil {
 		return "", fmt.Errorf("encode bridge turn: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint("/v1/cc-connect/turn"), bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("build bridge request: %w", err)
 	}
@@ -167,6 +172,20 @@ func main() {
 			fmt.Fprintf(os.Stderr, "project %q bridge configuration: %v\n", project.Name, err)
 			os.Exit(2)
 		}
+		cronControlListen, _ := project.Agent.Options["cron_control_listen"].(string)
+		if strings.TrimSpace(cronControlListen) == "" {
+			fmt.Fprintf(os.Stderr, "project %q bridge configuration: cron_control_listen is required\n", project.Name)
+			os.Exit(2)
+		}
+		cronController := newCronController(project.Name, bridge)
+		cronController.start()
+		defer cronController.stop()
+		controlURL, err := startCronControlServer(ctx, cronControlListen, bridgeToken, cronController)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "project %q cron control: %v\n", project.Name, err)
+			os.Exit(2)
+		}
+		slog.Info("cron control listening", "project", project.Name, "url", controlURL)
 		for _, platformConfig := range project.Platforms {
 			options := make(map[string]any, len(platformConfig.Options)+2)
 			for key, value := range platformConfig.Options {
