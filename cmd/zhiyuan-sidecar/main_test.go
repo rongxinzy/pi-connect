@@ -39,7 +39,7 @@ func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 	execPayload := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/cc-connect/cron/tasks",
-		bytes.NewBufferString(`{"taskId":"a","scheduleVersion":"v1","expression":"0 9 * * *","exec":"whoami"}`),
+		bytes.NewBufferString(`{"taskId":"a","scheduleVersion":"v1","schedule":{"kind":"cron","expr":"0 9 * * *"},"exec":"whoami"}`),
 	)
 	execPayload.Header.Set("Authorization", "Bearer secret")
 	execResponse := httptest.NewRecorder()
@@ -51,15 +51,23 @@ func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 
 func TestCronControllerValidatesTriggerOnlyRegistration(t *testing.T) {
 	controller := newCronController("project", &bridgeClient{})
-	if err := controller.upsert(cronTaskRequest{TaskID: "task", ScheduleVersion: "v1", Expression: "not a cron"}); err == nil {
+	if err := controller.upsert(cronTaskRequest{TaskID: "task", ScheduleVersion: "v1", Schedule: cronSchedule{Kind: "cron", Expr: "not a cron"}}); err == nil {
 		t.Fatal("invalid cron expression was accepted")
 	}
-	if err := controller.upsert(cronTaskRequest{TaskID: "task", ScheduleVersion: "v1", Expression: "0 9 * * *", Timezone: "Asia/Shanghai"}); err != nil {
+	if err := controller.upsert(cronTaskRequest{TaskID: "task", ScheduleVersion: "v1", Schedule: cronSchedule{Kind: "cron", Expr: "0 9 * * *", Timezone: "Asia/Shanghai"}}); err != nil {
 		t.Fatalf("valid cron registration: %v", err)
+	}
+	if err := controller.upsert(cronTaskRequest{TaskID: "interval", ScheduleVersion: "v1", Schedule: cronSchedule{Kind: "every", EveryMs: 1}}); err != nil {
+		t.Fatalf("valid interval registration: %v", err)
+	}
+	if err := controller.upsert(cronTaskRequest{TaskID: "once", ScheduleVersion: "v1", Schedule: cronSchedule{Kind: "at", At: time.Now().Add(time.Hour).Format(time.RFC3339)}}); err != nil {
+		t.Fatalf("valid one-time registration: %v", err)
 	}
 	if !controller.remove("task") || controller.remove("task") {
 		t.Fatal("remove did not preserve expected idempotency")
 	}
+	controller.remove("interval")
+	controller.remove("once")
 }
 
 func TestDeduplicatorExpiresEntries(t *testing.T) {

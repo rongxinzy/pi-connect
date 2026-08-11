@@ -25,14 +25,24 @@ type cronController struct {
 	bridge  *bridgeClient
 	cron    *cron.Cron
 	mu      sync.Mutex
-	jobs    map[string]cron.EntryID
+	jobs    map[string]func()
 }
 
 type cronTaskRequest struct {
-	TaskID          string `json:"taskId"`
-	ScheduleVersion string `json:"scheduleVersion"`
-	Expression      string `json:"expression"`
-	Timezone        string `json:"timezone,omitempty"`
+	TaskID          string       `json:"taskId"`
+	ScheduleVersion string       `json:"scheduleVersion"`
+	Schedule        cronSchedule `json:"schedule"`
+}
+
+// cronSchedule is a trigger-only schedule description. It deliberately has
+// neither a command nor a payload: both remain owned by ZhiYuan.
+type cronSchedule struct {
+	Kind     string `json:"kind"`
+	At       string `json:"at,omitempty"`
+	EveryMs  int64  `json:"everyMs,omitempty"`
+	AnchorMs *int64 `json:"anchorMs,omitempty"`
+	Expr     string `json:"expr,omitempty"`
+	Timezone string `json:"tz,omitempty"`
 }
 
 func newCronController(project string, bridge *bridgeClient) *cronController {
@@ -40,7 +50,7 @@ func newCronController(project string, bridge *bridgeClient) *cronController {
 		project: project,
 		bridge:  bridge,
 		cron:    cron.New(),
-		jobs:    make(map[string]cron.EntryID),
+		jobs:    make(map[string]func()),
 	}
 }
 
@@ -52,47 +62,117 @@ func (c *cronController) upsert(request cronTaskRequest) error {
 	if strings.TrimSpace(request.TaskID) == "" || strings.TrimSpace(request.ScheduleVersion) == "" {
 		return errors.New("taskId and scheduleVersion are required")
 	}
-	if strings.TrimSpace(request.Expression) == "" {
-		return errors.New("expression is required")
-	}
-	location := time.Local
-	if strings.TrimSpace(request.Timezone) != "" {
-		resolved, err := time.LoadLocation(request.Timezone)
-		if err != nil {
-			return fmt.Errorf("invalid timezone: %w", err)
-		}
-		location = resolved
+	stop, err := c.register(request)
+	if err != nil {
+		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.jobs[request.TaskID]; ok {
-		c.cron.Remove(existing)
+		existing()
 	}
-	entryID, err := c.cron.AddFunc("CRON_TZ="+location.String()+" "+request.Expression, func() {
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTurnTimeout)
-		defer cancel()
-		if err := c.bridge.triggerCron(ctx, c.project, request.TaskID, request.ScheduleVersion, time.Now().UTC()); err != nil {
-			// The next ZhiYuan reconciliation is responsible for retry/backoff.
-			fmt.Printf("cron trigger failed task_id=%s: %v\n", request.TaskID, err)
-		}
-	})
-	if err != nil {
-		return fmt.Errorf("invalid cron expression: %w", err)
-	}
-	c.jobs[request.TaskID] = entryID
+	c.jobs[request.TaskID] = stop
 	return nil
 }
 
 func (c *cronController) remove(taskID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.jobs[taskID]
+	stop, ok := c.jobs[taskID]
 	if !ok {
 		return false
 	}
-	c.cron.Remove(entry)
+	stop()
 	delete(c.jobs, taskID)
 	return true
+}
+
+func (c *cronController) trigger(taskID, version string) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTurnTimeout)
+	defer cancel()
+	if err := c.bridge.triggerCron(ctx, c.project, taskID, version, time.Now().UTC()); err != nil {
+		// ZhiYuan reconciliation is responsible for retry/backoff.
+		fmt.Printf("cron trigger failed task_id=%s: %v\n", taskID, err)
+	}
+}
+
+func (c *cronController) register(request cronTaskRequest) (func(), error) {
+	switch request.Schedule.Kind {
+	case "cron":
+		if strings.TrimSpace(request.Schedule.Expr) == "" {
+			return nil, errors.New("cron expr is required")
+		}
+		location := time.Local
+		if strings.TrimSpace(request.Schedule.Timezone) != "" {
+			resolved, err := time.LoadLocation(request.Schedule.Timezone)
+			if err != nil {
+				return nil, fmt.Errorf("invalid timezone: %w", err)
+			}
+			location = resolved
+		}
+		entry, err := c.cron.AddFunc("CRON_TZ="+location.String()+" "+request.Schedule.Expr, func() { c.trigger(request.TaskID, request.ScheduleVersion) })
+		if err != nil {
+			return nil, fmt.Errorf("invalid cron expression: %w", err)
+		}
+		return func() { c.cron.Remove(entry) }, nil
+	case "at":
+		at, err := time.Parse(time.RFC3339, request.Schedule.At)
+		if err != nil {
+			return nil, errors.New("at must be RFC3339")
+		}
+		if !at.After(time.Now()) {
+			return nil, errors.New("at schedule must be in the future")
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			timer := time.NewTimer(time.Until(at))
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				c.trigger(request.TaskID, request.ScheduleVersion)
+			}
+		}()
+		return cancel, nil
+	case "every":
+		if request.Schedule.EveryMs <= 0 {
+			return nil, errors.New("everyMs must be positive")
+		}
+		interval := time.Duration(request.Schedule.EveryMs) * time.Millisecond
+		next := time.Now().Add(interval)
+		if request.Schedule.AnchorMs != nil {
+			anchor := time.UnixMilli(*request.Schedule.AnchorMs)
+			for !anchor.After(time.Now()) {
+				anchor = anchor.Add(interval)
+			}
+			next = anchor
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			timer := time.NewTimer(time.Until(next))
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				c.trigger(request.TaskID, request.ScheduleVersion)
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					c.trigger(request.TaskID, request.ScheduleVersion)
+				}
+			}
+		}()
+		return cancel, nil
+	default:
+		return nil, errors.New("schedule.kind must be at, every, or cron")
+	}
 }
 
 func (b *bridgeClient) triggerCron(
