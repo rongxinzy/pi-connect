@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/chenhg5/cc-connect/config"
 )
 
 func TestBridgeOnlyAcceptsLoopbackEndpoints(t *testing.T) {
@@ -66,5 +70,47 @@ func TestDeduplicatorExpiresEntries(t *testing.T) {
 	}
 	if !dedup.accept("telegram:1", now.Add(duplicateTTL+time.Second)) {
 		t.Fatal("deduplicator did not expire entry")
+	}
+}
+
+// This is the versioned contract emitted by RongxinAI's
+// CcConnectSidecarConfig serializer. The agent type is intentionally never
+// instantiated by this command; it only carries bridge control-plane options.
+func TestZhiyuanBridgeConfigContractLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zhiyuan-sidecar.toml")
+	contents := `data_dir = "C:\\Users\\test\\AppData\\Local\\ZhiYuanAgent\\cc-connect"
+
+[webhook]
+enabled = false
+
+[bridge]
+enabled = false
+
+[management]
+enabled = false
+
+[[projects]]
+name = "telegram-primary"
+[projects.agent]
+type = "zhiyuan-bridge"
+[projects.agent.options]
+bridge_url = "http://127.0.0.1:34567"
+bridge_token = "secret"
+cron_control_listen = "127.0.0.1:0"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "token"
+allow_from = ["u1"]
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load ZhiYuan sidecar contract: %v", err)
+	}
+	if len(cfg.Projects) != 1 || cfg.Projects[0].Agent.Type != "zhiyuan-bridge" {
+		t.Fatalf("unexpected project contract: %#v", cfg.Projects)
 	}
 }
