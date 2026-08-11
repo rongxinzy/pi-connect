@@ -23,7 +23,6 @@ import (
 type cronController struct {
 	project string
 	bridge  *bridgeClient
-	cron    *cron.Cron
 	mu      sync.Mutex
 	jobs    map[string]func()
 }
@@ -49,14 +48,13 @@ func newCronController(project string, bridge *bridgeClient) *cronController {
 	return &cronController{
 		project: project,
 		bridge:  bridge,
-		cron:    cron.New(),
 		jobs:    make(map[string]func()),
 	}
 }
 
-func (c *cronController) start() { c.cron.Start() }
+func (c *cronController) start() {}
 
-func (c *cronController) stop() context.Context { return c.cron.Stop() }
+func (c *cronController) stop() context.Context { return context.Background() }
 
 func (c *cronController) upsert(request cronTaskRequest) error {
 	if strings.TrimSpace(request.TaskID) == "" || strings.TrimSpace(request.ScheduleVersion) == "" {
@@ -110,11 +108,33 @@ func (c *cronController) register(request cronTaskRequest) (func(), error) {
 			}
 			location = resolved
 		}
-		entry, err := c.cron.AddFunc("CRON_TZ="+location.String()+" "+request.Schedule.Expr, func() { c.trigger(request.TaskID, request.ScheduleVersion) })
+		schedule, err := cron.ParseStandard("CRON_TZ=" + location.String() + " " + request.Schedule.Expr)
 		if err != nil {
 			return nil, fmt.Errorf("invalid cron expression: %w", err)
 		}
-		return func() { c.cron.Remove(entry) }, nil
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			for {
+				next := schedule.Next(time.Now())
+				timer := time.NewTimer(time.Until(next))
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				case <-timer.C:
+					// A monotonic timer that expires while the machine sleeps is
+					// delivered once on wake, intentionally recovering that missed
+					// cron occurrence before calculating the next one.
+					c.trigger(request.TaskID, request.ScheduleVersion)
+				}
+			}
+		}()
+		return cancel, nil
 	case "at":
 		at, err := time.Parse(time.RFC3339, request.Schedule.At)
 		if err != nil {
