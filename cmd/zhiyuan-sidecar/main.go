@@ -122,6 +122,13 @@ func bridgeChannelID(msg *core.Message) string {
 	return strings.TrimSpace(msg.ChannelID)
 }
 
+type configuredPlatform struct {
+	accountID string
+	platform  core.Platform
+	bridge    *bridgeClient
+	isAsync   bool
+}
+
 func newRequestID() (string, error) {
 	data := make([]byte, 16)
 	if _, err := rand.Read(data); err != nil {
@@ -166,6 +173,7 @@ func main() {
 	var controlToken string
 	controlSender := &deliverySender{}
 	platformStatuses := newPlatformStatusRegistry()
+	var configuredPlatforms []configuredPlatform
 	for _, project := range cfg.Projects {
 		bridgeURL, _ := project.Agent.Options["bridge_url"].(string)
 		bridgeToken, _ := project.Agent.Options["bridge_token"].(string)
@@ -205,33 +213,13 @@ func main() {
 			if async, ok := platform.(core.AsyncRecoverablePlatform); ok {
 				async.SetLifecycleHandler(&projectPlatformLifecycle{accountID: project.Name, statuses: platformStatuses})
 			}
-			if err := platform.Start(func(p core.Platform, msg *core.Message) {
-				if msg == nil || strings.TrimSpace(msg.MessageID) == "" {
-					return
-				}
-				go func() {
-					turnCtx, turnCancel := context.WithTimeout(ctx, defaultTurnTimeout)
-					defer turnCancel()
-					content, err := bridge.runTurn(turnCtx, project.Name, msg)
-					if err != nil {
-						slog.Error("ZhiYuan bridge turn failed", "project", project.Name, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
-						_ = p.Reply(context.Background(), msg.ReplyCtx, "暂时无法处理这条消息，请稍后重试。")
-						return
-					}
-					if err := p.Reply(context.Background(), msg.ReplyCtx, content); err != nil {
-						slog.Error("send channel reply", "project", project.Name, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
-					}
-				}()
-			}); err != nil {
-				platformStatuses.set(project.Name, platform.Name(), platformStateUnavailable, err)
-				slog.Error("start channel platform", "project", project.Name, "platform", platform.Name(), "error", err)
-				continue
-			}
-			if !isAsync {
-				platformStatuses.set(project.Name, platform.Name(), platformStateReady, nil)
-			}
+			configuredPlatforms = append(configuredPlatforms, configuredPlatform{
+				accountID: project.Name,
+				platform:  platform,
+				bridge:    bridge,
+				isAsync:   isAsync,
+			})
 			platforms = append(platforms, platform)
-			controlSender.register(project.Name, platform)
 		}
 	}
 	if len(controllers) == 0 {
@@ -244,5 +232,36 @@ func main() {
 		os.Exit(2)
 	}
 	slog.Info("channel control listening", "projects", len(controllers), "url", controlURL)
+	for _, configured := range configuredPlatforms {
+		configured := configured
+		go func() {
+			if err := configured.platform.Start(func(p core.Platform, msg *core.Message) {
+				if msg == nil || strings.TrimSpace(msg.MessageID) == "" {
+					return
+				}
+				go func() {
+					turnCtx, turnCancel := context.WithTimeout(ctx, defaultTurnTimeout)
+					defer turnCancel()
+					content, err := configured.bridge.runTurn(turnCtx, configured.accountID, msg)
+					if err != nil {
+						slog.Error("ZhiYuan bridge turn failed", "project", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
+						_ = p.Reply(context.Background(), msg.ReplyCtx, "暂时无法处理这条消息，请稍后重试。")
+						return
+					}
+					if err := p.Reply(context.Background(), msg.ReplyCtx, content); err != nil {
+						slog.Error("send channel reply", "project", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
+					}
+				}()
+			}); err != nil {
+				platformStatuses.set(configured.accountID, configured.platform.Name(), platformStateUnavailable, err)
+				slog.Error("start channel platform", "project", configured.accountID, "platform", configured.platform.Name(), "error", err)
+				return
+			}
+			if !configured.isAsync {
+				platformStatuses.set(configured.accountID, configured.platform.Name(), platformStateReady, nil)
+			}
+			controlSender.register(configured.accountID, configured.platform)
+		}()
+	}
 	<-ctx.Done()
 }
