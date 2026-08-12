@@ -77,7 +77,7 @@ func (b *bridgeClient) runTurn(ctx context.Context, project string, msg *core.Me
 		"project":   project,
 		"message": map[string]any{
 			"sessionKey": msg.SessionKey, "platform": msg.Platform, "messageId": msg.MessageID,
-			"channelId": msg.ChannelID, "userId": msg.UserID, "userName": msg.UserName,
+			"channelId": bridgeChannelID(msg), "userId": msg.UserID, "userName": msg.UserName,
 			"chatName": msg.ChatName, "content": msg.Content, "extraContent": msg.ExtraContent,
 			"images": msg.Images, "files": msg.Files, "userMessageTimeMs": msg.UserMessageTimeMs,
 		},
@@ -112,6 +112,16 @@ func (b *bridgeClient) runTurn(ctx context.Context, project string, msg *core.Me
 	return result.Content, nil
 }
 
+func bridgeChannelID(msg *core.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if channelKey := strings.TrimSpace(msg.ChannelKey); channelKey != "" {
+		return channelKey
+	}
+	return strings.TrimSpace(msg.ChannelID)
+}
+
 func newRequestID() (string, error) {
 	data := make([]byte, 16)
 	if _, err := rand.Read(data); err != nil {
@@ -121,6 +131,13 @@ func newRequestID() (string, error) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "weixin-setup" {
+		if err := runWeixinSetupCommand(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		return
+	}
 	configPath := os.Getenv("CC_CONNECT_CONFIG")
 	if strings.TrimSpace(configPath) == "" {
 		fmt.Fprintln(os.Stderr, "CC_CONNECT_CONFIG is required")
@@ -134,13 +151,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var platforms []core.Platform
+	var controllers []*cronController
 	defer func() {
 		for _, platform := range platforms {
 			if err := platform.Stop(); err != nil {
 				slog.Warn("stop platform", "platform", platform.Name(), "error", err)
 			}
 		}
+		for _, controller := range controllers {
+			controller.stop()
+		}
 	}()
+	var controlListen string
+	var controlToken string
+	controlSender := &deliverySender{}
+	platformStatuses := newPlatformStatusRegistry()
 	for _, project := range cfg.Projects {
 		bridgeURL, _ := project.Agent.Options["bridge_url"].(string)
 		bridgeToken, _ := project.Agent.Options["bridge_token"].(string)
@@ -154,16 +179,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "project %q bridge configuration: cron_control_listen is required\n", project.Name)
 			os.Exit(2)
 		}
-		cronController := newCronController(project.Name, bridge, cfg.DataDir)
-		cronController.start()
-		defer cronController.stop()
-		sender := &deliverySender{}
-		controlURL, err := startCronControlServer(ctx, cronControlListen, bridgeToken, cronController, sender)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "project %q cron control: %v\n", project.Name, err)
+		if controlListen == "" {
+			controlListen, controlToken = cronControlListen, bridgeToken
+		} else if controlListen != cronControlListen || controlToken != bridgeToken {
+			fmt.Fprintln(os.Stderr, "all projects must share cron_control_listen and bridge_token")
 			os.Exit(2)
 		}
-		slog.Info("cron control listening", "project", project.Name, "url", controlURL)
+		cronController := newCronController(project.Name, bridge, cfg.DataDir)
+		cronController.start()
+		controllers = append(controllers, cronController)
 		for _, platformConfig := range project.Platforms {
 			options := make(map[string]any, len(platformConfig.Options)+2)
 			for key, value := range platformConfig.Options {
@@ -172,8 +196,14 @@ func main() {
 			options["cc_data_dir"], options["cc_project"] = cfg.DataDir, project.Name
 			platform, err := core.CreatePlatform(platformConfig.Type, options)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "project %q platform %q: %v\n", project.Name, platformConfig.Type, err)
-				os.Exit(2)
+				platformStatuses.set(project.Name, platformConfig.Type, platformStateUnavailable, err)
+				slog.Error("create channel platform", "project", project.Name, "platform", platformConfig.Type, "error", err)
+				continue
+			}
+			platformStatuses.set(project.Name, platform.Name(), platformStateStarting, nil)
+			_, isAsync := platform.(core.AsyncRecoverablePlatform)
+			if async, ok := platform.(core.AsyncRecoverablePlatform); ok {
+				async.SetLifecycleHandler(&projectPlatformLifecycle{accountID: project.Name, statuses: platformStatuses})
 			}
 			if err := platform.Start(func(p core.Platform, msg *core.Message) {
 				if msg == nil || strings.TrimSpace(msg.MessageID) == "" {
@@ -193,12 +223,26 @@ func main() {
 					}
 				}()
 			}); err != nil {
-				fmt.Fprintf(os.Stderr, "start project %q platform %q: %v\n", project.Name, platform.Name(), err)
-				os.Exit(2)
+				platformStatuses.set(project.Name, platform.Name(), platformStateUnavailable, err)
+				slog.Error("start channel platform", "project", project.Name, "platform", platform.Name(), "error", err)
+				continue
+			}
+			if !isAsync {
+				platformStatuses.set(project.Name, platform.Name(), platformStateReady, nil)
 			}
 			platforms = append(platforms, platform)
-			sender.register(platform)
+			controlSender.register(project.Name, platform)
 		}
 	}
+	if len(controllers) == 0 {
+		fmt.Fprintln(os.Stderr, "at least one project is required")
+		os.Exit(2)
+	}
+	controlURL, err := startCronControlServer(ctx, controlListen, controlToken, newCronControllerRegistry(controllers), controlSender, platformStatuses)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "channel control: %v\n", err)
+		os.Exit(2)
+	}
+	slog.Info("channel control listening", "projects", len(controllers), "url", controlURL)
 	<-ctx.Done()
 }

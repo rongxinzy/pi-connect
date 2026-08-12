@@ -43,14 +43,42 @@ type pendingTrigger struct {
 }
 
 type cronTaskRequest struct {
+	AccountID       string       `json:"accountId"`
 	TaskID          string       `json:"taskId"`
 	ScheduleVersion string       `json:"scheduleVersion"`
 	Schedule        cronSchedule `json:"schedule"`
 }
 
+type cronControllerRegistry struct {
+	controllers map[string]*cronController
+}
+
+func newCronControllerRegistry(controllers []*cronController) *cronControllerRegistry {
+	registry := &cronControllerRegistry{controllers: make(map[string]*cronController, len(controllers))}
+	for _, controller := range controllers {
+		if controller != nil {
+			registry.controllers[controller.project] = controller
+		}
+	}
+	return registry
+}
+
+func (r *cronControllerRegistry) resolve(accountID string) (*cronController, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, errors.New("accountId is required")
+	}
+	controller := r.controllers[accountID]
+	if controller == nil {
+		return nil, errors.New("configured project is unavailable")
+	}
+	return controller, nil
+}
+
 // deliveryRequest contains only a resolved outbound target and final text.
 // It deliberately excludes prompts, tool inputs, and arbitrary commands.
 type deliveryRequest struct {
+	AccountID  string `json:"accountId"`
 	Platform   string `json:"platform"`
 	SessionKey string `json:"sessionKey"`
 	Content    string `json:"content"`
@@ -61,21 +89,21 @@ type deliverySender struct {
 	platforms map[string]core.Platform
 }
 
-func (s *deliverySender) register(platform core.Platform) {
+func (s *deliverySender) register(accountID string, platform core.Platform) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.platforms == nil {
 		s.platforms = make(map[string]core.Platform)
 	}
-	s.platforms[platform.Name()] = platform
+	s.platforms[deliveryPlatformKey(accountID, platform.Name())] = platform
 }
 
 func (s *deliverySender) send(request deliveryRequest) error {
-	if strings.TrimSpace(request.Platform) == "" || strings.TrimSpace(request.SessionKey) == "" || strings.TrimSpace(request.Content) == "" {
-		return errors.New("platform, sessionKey, and content are required")
+	if strings.TrimSpace(request.AccountID) == "" || strings.TrimSpace(request.Platform) == "" || strings.TrimSpace(request.SessionKey) == "" || strings.TrimSpace(request.Content) == "" {
+		return errors.New("accountId, platform, sessionKey, and content are required")
 	}
 	s.mu.RLock()
-	platform := s.platforms[request.Platform]
+	platform := s.platforms[deliveryPlatformKey(request.AccountID, request.Platform)]
 	s.mu.RUnlock()
 	if platform == nil {
 		return errors.New("configured platform is unavailable")
@@ -92,6 +120,10 @@ func (s *deliverySender) send(request deliveryRequest) error {
 		return fmt.Errorf("send delivery: %w", err)
 	}
 	return nil
+}
+
+func deliveryPlatformKey(accountID, platform string) string {
+	return strings.TrimSpace(accountID) + "\x00" + strings.TrimSpace(platform)
 }
 
 // cronSchedule is a trigger-only schedule description. It deliberately has
@@ -337,7 +369,7 @@ func (b *bridgeClient) triggerCron(
 	return nil
 }
 
-func startCronControlServer(ctx context.Context, rawAddress, token string, controller *cronController, sender *deliverySender) (string, error) {
+func startCronControlServer(ctx context.Context, rawAddress, token string, controllers *cronControllerRegistry, sender *deliverySender, statuses *platformStatusRegistry) (string, error) {
 	address := strings.TrimSpace(rawAddress)
 	host, _, err := net.SplitHostPort(address)
 	if err != nil || !isLoopbackHost(host) {
@@ -351,7 +383,7 @@ func startCronControlServer(ctx context.Context, rawAddress, token string, contr
 		listener.Close()
 		return "", errors.New("cron control token is required")
 	}
-	server := &http.Server{Handler: cronControlHandler(token, controller, sender), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: cronControlHandler(token, controllers, sender, statuses), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -474,7 +506,7 @@ func (c *cronController) removePersistedTriggerLocked(identity string) error {
 	return err
 }
 
-func cronControlHandler(token string, controller *cronController, sender *deliverySender) http.Handler {
+func cronControlHandler(token string, controllers *cronControllerRegistry, sender *deliverySender, statuses *platformStatusRegistry) http.Handler {
 	authenticator := &requestAuthenticator{token: token}
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if err := authenticator.authorize(request); err != nil {
@@ -486,13 +518,18 @@ func cronControlHandler(token string, controller *cronController, sender *delive
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/cc-connect/cron/health":
 			response.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(response).Encode(currentHealth())
+			_ = json.NewEncoder(response).Encode(currentHealth(statuses))
 		case request.Method == http.MethodPost && request.URL.Path == taskPath:
 			decoder := json.NewDecoder(io.LimitReader(request.Body, 64<<10))
 			decoder.DisallowUnknownFields()
 			var payload cronTaskRequest
 			if err := decoder.Decode(&payload); err != nil || decoder.More() {
 				http.Error(response, "invalid cron task request", http.StatusBadRequest)
+				return
+			}
+			controller, err := controllers.resolve(payload.AccountID)
+			if err != nil {
+				http.Error(response, err.Error(), http.StatusBadRequest)
 				return
 			}
 			if err := controller.upsert(payload); err != nil {
@@ -521,6 +558,11 @@ func cronControlHandler(token string, controller *cronController, sender *delive
 			taskID := strings.TrimPrefix(request.URL.Path, taskPath+"/")
 			if taskID == "" || strings.Contains(taskID, "/") {
 				http.Error(response, "invalid task id", http.StatusBadRequest)
+				return
+			}
+			controller, err := controllers.resolve(request.URL.Query().Get("accountId"))
+			if err != nil {
+				http.Error(response, err.Error(), http.StatusBadRequest)
 				return
 			}
 			if !controller.remove(taskID) {

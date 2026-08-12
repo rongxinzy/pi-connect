@@ -22,9 +22,14 @@ func authorizeTestRequest(request *http.Request, nonce string) {
 	request.Header.Set("X-ZhiYuan-Nonce", nonce)
 }
 
-type deliveryPlatformStub struct{ sent string }
+type deliveryPlatformStub struct{ name, sent string }
 
-func (p *deliveryPlatformStub) Name() string                             { return "telegram" }
+func (p *deliveryPlatformStub) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "telegram"
+}
 func (p *deliveryPlatformStub) Start(core.MessageHandler) error          { return nil }
 func (p *deliveryPlatformStub) Reply(context.Context, any, string) error { return nil }
 func (p *deliveryPlatformStub) Send(_ context.Context, _ any, content string) error {
@@ -51,7 +56,7 @@ func TestBridgeOnlyAcceptsLoopbackEndpoints(t *testing.T) {
 
 func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 	controller := newCronController("project", &bridgeClient{})
-	handler := cronControlHandler("secret", controller, nil)
+	handler := cronControlHandler("secret", newCronControllerRegistry([]*cronController{controller}), nil, nil)
 
 	unauthorized := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/cron/tasks", nil)
 	unauthorizedResponse := httptest.NewRecorder()
@@ -88,10 +93,10 @@ func TestDeliveryControlUsesOnlyConfiguredProactivePlatform(t *testing.T) {
 	controller := newCronController("project", &bridgeClient{})
 	sender := &deliverySender{}
 	platform := &deliveryPlatformStub{}
-	sender.register(platform)
-	handler := cronControlHandler("secret", controller, sender)
+	sender.register("account", platform)
+	handler := cronControlHandler("secret", newCronControllerRegistry([]*cronController{controller}), sender, nil)
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"platform":"telegram","sessionKey":"telegram:42","content":"done"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"accountId":"account","platform":"telegram","sessionKey":"telegram:42","content":"done"}`))
 	authorizeTestRequest(request, "delivery-nonce")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -99,7 +104,7 @@ func TestDeliveryControlUsesOnlyConfiguredProactivePlatform(t *testing.T) {
 		t.Fatalf("delivery result status=%d content=%q", response.Code, platform.sent)
 	}
 
-	bad := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"platform":"telegram","sessionKey":"telegram:42","content":"done","exec":"whoami"}`))
+	bad := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"accountId":"account","platform":"telegram","sessionKey":"telegram:42","content":"done","exec":"whoami"}`))
 	authorizeTestRequest(bad, "bad-delivery-nonce")
 	badResponse := httptest.NewRecorder()
 	handler.ServeHTTP(badResponse, bad)
@@ -108,9 +113,23 @@ func TestDeliveryControlUsesOnlyConfiguredProactivePlatform(t *testing.T) {
 	}
 }
 
+func TestDeliverySenderRoutesByAccountAndPlatform(t *testing.T) {
+	sender := &deliverySender{}
+	first := &deliveryPlatformStub{name: "dingtalk"}
+	second := &deliveryPlatformStub{name: "dingtalk"}
+	sender.register("first", first)
+	sender.register("second", second)
+	if err := sender.send(deliveryRequest{AccountID: "second", Platform: "dingtalk", SessionKey: "dingtalk:g:chat", Content: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if first.sent != "" || second.sent != "hello" {
+		t.Fatalf("unexpected routing first=%q second=%q", first.sent, second.sent)
+	}
+}
+
 func TestCronControlRejectsReplayedNonce(t *testing.T) {
 	controller := newCronController("project", &bridgeClient{})
-	handler := cronControlHandler("secret", controller, nil)
+	handler := cronControlHandler("secret", newCronControllerRegistry([]*cronController{controller}), nil, nil)
 	for attempt := 0; attempt < 2; attempt++ {
 		request := httptest.NewRequest(http.MethodGet, "/v1/cc-connect/cron/health", nil)
 		authorizeTestRequest(request, "same-nonce")
@@ -123,6 +142,40 @@ func TestCronControlRejectsReplayedNonce(t *testing.T) {
 		if response.Code != want {
 			t.Fatalf("attempt %d status=%d want=%d", attempt, response.Code, want)
 		}
+	}
+}
+
+func TestCronControlRoutesTasksByAccount(t *testing.T) {
+	first := newCronController("first", &bridgeClient{})
+	second := newCronController("second", &bridgeClient{})
+	handler := cronControlHandler(
+		"secret",
+		newCronControllerRegistry([]*cronController{first, second}),
+		nil,
+		nil,
+	)
+
+	upsert := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/cc-connect/cron/tasks",
+		bytes.NewBufferString(`{"accountId":"second","taskId":"task","scheduleVersion":"v1","schedule":{"kind":"at","at":"2099-01-01T00:00:00Z"}}`),
+	)
+	authorizeTestRequest(upsert, "route-upsert")
+	upsertResponse := httptest.NewRecorder()
+	handler.ServeHTTP(upsertResponse, upsert)
+	if upsertResponse.Code != http.StatusNoContent {
+		t.Fatalf("upsert status=%d body=%s", upsertResponse.Code, upsertResponse.Body.String())
+	}
+	if len(first.jobs) != 0 || len(second.jobs) != 1 {
+		t.Fatalf("unexpected routed jobs first=%d second=%d", len(first.jobs), len(second.jobs))
+	}
+
+	remove := httptest.NewRequest(http.MethodDelete, "/v1/cc-connect/cron/tasks/task?accountId=second", nil)
+	authorizeTestRequest(remove, "route-remove")
+	removeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(removeResponse, remove)
+	if removeResponse.Code != http.StatusNoContent || len(second.jobs) != 0 {
+		t.Fatalf("remove status=%d second jobs=%d", removeResponse.Code, len(second.jobs))
 	}
 }
 
@@ -262,5 +315,16 @@ cron_control_listen = "127.0.0.1:0"
 	}
 	if len(cfg.Projects) != 1 || len(cfg.Projects[0].Platforms) != 0 {
 		t.Fatalf("unexpected scheduler-only project contract: %#v", cfg.Projects)
+	}
+}
+
+func TestBridgeChannelIDPrefersWorkspaceChannelKey(t *testing.T) {
+	message := &core.Message{ChannelID: "legacy-channel", ChannelKey: "native-channel"}
+	if got := bridgeChannelID(message); got != "native-channel" {
+		t.Fatalf("bridgeChannelID() = %q, want native-channel", got)
+	}
+	message.ChannelKey = ""
+	if got := bridgeChannelID(message); got != "legacy-channel" {
+		t.Fatalf("bridgeChannelID() fallback = %q, want legacy-channel", got)
 	}
 }

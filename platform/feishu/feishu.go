@@ -37,7 +37,8 @@ import (
 
 // sanitizingLogger wraps a logger and masks sensitive URL parameters.
 type sanitizingLogger struct {
-	inner larkcore.Logger
+	inner  larkcore.Logger
+	onInfo func(string)
 }
 
 func (l *sanitizingLogger) maskURL(args ...interface{}) []interface{} {
@@ -86,7 +87,11 @@ func (l *sanitizingLogger) Debug(ctx context.Context, args ...interface{}) {
 }
 
 func (l *sanitizingLogger) Info(ctx context.Context, args ...interface{}) {
-	l.inner.Info(ctx, l.maskURL(args...)...)
+	masked := l.maskURL(args...)
+	l.inner.Info(ctx, masked...)
+	if l.onInfo != nil {
+		l.onInfo(fmt.Sprint(masked...))
+	}
 }
 
 func (l *sanitizingLogger) Warn(ctx context.Context, args ...interface{}) {
@@ -184,6 +189,7 @@ type Platform struct {
 	imageBatchMu     sync.Mutex
 	imageBatch       map[string]*imageBatchEntry
 	imageBatchWindow time.Duration // quiet period before flushing a batch; 0 means use defaultImageBatchWindow
+	lifecycle        core.PlatformLifecycleHandler
 }
 
 // defaultImageBatchWindow is the quiet period after the last image in a
@@ -265,6 +271,30 @@ type feishuRequestFunc func(client *lark.Client, options ...larkcore.RequestOpti
 
 func (p *Platform) SetCardNavigationHandler(h core.CardNavigationHandler) {
 	p.cardNavHandler = h
+}
+
+func (p *Platform) SetLifecycleHandler(handler core.PlatformLifecycleHandler) {
+	p.mu.Lock()
+	p.lifecycle = handler
+	p.mu.Unlock()
+}
+
+func (p *Platform) notifyReady() {
+	p.mu.RLock()
+	handler := p.lifecycle
+	p.mu.RUnlock()
+	if handler != nil {
+		handler.OnPlatformReady(p)
+	}
+}
+
+func (p *Platform) notifyUnavailable(err error) {
+	p.mu.RLock()
+	handler := p.lifecycle
+	p.mu.RUnlock()
+	if handler != nil {
+		handler.OnPlatformUnavailable(p, err)
+	}
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -497,6 +527,11 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	// Secondary platforms skip connection creation — the primary's connection
 	// fans out events to all platforms in the shared group.
 	if !isPrimary {
+		if ready, lastError := group.currentLifecycle(); ready {
+			p.notifyReady()
+		} else if lastError != nil {
+			p.notifyUnavailable(lastError)
+		}
 		return nil
 	}
 
@@ -579,7 +614,17 @@ func (p *Platform) startWebSocketMode() error {
 	wsOpts := []larkws.ClientOption{
 		larkws.WithEventHandler(p.eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
-		larkws.WithLogger(&sanitizingLogger{inner: larkcore.NewEventLogger()}),
+		larkws.WithLogger(&sanitizingLogger{
+			inner: larkcore.NewEventLogger(),
+			onInfo: func(message string) {
+				normalized := strings.ToLower(message)
+				if strings.Contains(normalized, "disconnected to") {
+					p.sharedGroup.markUnavailable(errors.New("Feishu websocket disconnected"))
+				} else if strings.Contains(normalized, "connected to") {
+					p.sharedGroup.markReady()
+				}
+			},
+		}),
 	}
 	if p.domain != lark.FeishuBaseUrl {
 		wsOpts = append(wsOpts, larkws.WithDomain(p.domain))
@@ -593,6 +638,7 @@ func (p *Platform) startWebSocketMode() error {
 
 	go func() {
 		if err := p.wsClient.Start(ctx); err != nil {
+			p.sharedGroup.markUnavailable(err)
 			slog.Error(p.tag()+": websocket error", "error", err)
 		}
 	}()
@@ -615,15 +661,22 @@ func (p *Platform) startWebhookMode() error {
 	p.cancel = cancel
 	p.mu.Unlock()
 
+	listener, err := net.Listen("tcp", p.server.Addr)
+	if err != nil {
+		return fmt.Errorf("%s: webhook listen: %w", p.tag(), err)
+	}
 	go func() {
 		slog.Info(p.tag()+": webhook server listening", "port", p.port, "path", p.callbackPath)
-		if err := p.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := p.server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			p.notifyUnavailable(err)
 			slog.Error(p.tag()+": webhook server error", "error", err)
 		}
 	}()
-
+	p.notifyReady()
 	return nil
 }
+
+var _ core.AsyncRecoverablePlatform = (*Platform)(nil)
 
 // webhookHandler handles HTTP webhook requests from Lark international version
 func (p *Platform) webhookHandler(w http.ResponseWriter, r *http.Request) {

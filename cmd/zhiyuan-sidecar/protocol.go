@@ -84,18 +84,24 @@ func addProtocolHeaders(request *http.Request, requestID string) error {
 }
 
 type healthResponse struct {
-	ProtocolVersion string   `json:"protocolVersion"`
-	PID             int      `json:"pid"`
-	ParentPID       int      `json:"parentPid"`
-	Capabilities    []string `json:"capabilities"`
+	ProtocolVersion string                  `json:"protocolVersion"`
+	PID             int                     `json:"pid"`
+	ParentPID       int                     `json:"parentPid"`
+	Capabilities    []string                `json:"capabilities"`
+	Platforms       []platformRuntimeStatus `json:"platforms"`
 }
 
-func currentHealth() healthResponse {
+func currentHealth(statuses *platformStatusRegistry) healthResponse {
+	var platforms []platformRuntimeStatus
+	if statuses != nil {
+		platforms = statuses.snapshot()
+	}
 	return healthResponse{
 		ProtocolVersion: zhiyuanProtocolVersion,
 		PID:             os.Getpid(),
 		ParentPID:       os.Getppid(),
 		Capabilities:    []string{"channel-transport", "delivery", "trigger-only-cron"},
+		Platforms:       platforms,
 	}
 }
 

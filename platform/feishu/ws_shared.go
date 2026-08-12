@@ -1,6 +1,7 @@
 package feishu
 
 import (
+	"errors"
 	"log/slog"
 	"sync"
 )
@@ -13,6 +14,39 @@ import (
 type sharedWSGroup struct {
 	mu        sync.RWMutex
 	platforms []*Platform
+	ready     bool
+	lastError error
+}
+
+func (g *sharedWSGroup) markReady() {
+	g.mu.Lock()
+	g.ready = true
+	g.lastError = nil
+	platforms := append([]*Platform(nil), g.platforms...)
+	g.mu.Unlock()
+	for _, platform := range platforms {
+		platform.notifyReady()
+	}
+}
+
+func (g *sharedWSGroup) markUnavailable(err error) {
+	if err == nil {
+		err = errors.New("Feishu websocket is unavailable")
+	}
+	g.mu.Lock()
+	g.ready = false
+	g.lastError = err
+	platforms := append([]*Platform(nil), g.platforms...)
+	g.mu.Unlock()
+	for _, platform := range platforms {
+		platform.notifyUnavailable(err)
+	}
+}
+
+func (g *sharedWSGroup) currentLifecycle() (bool, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.ready, g.lastError
 }
 
 var (
