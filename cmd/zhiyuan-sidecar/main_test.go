@@ -189,17 +189,6 @@ func TestCronOutboxSurvivesRestart(t *testing.T) {
 	second.mu.Unlock()
 }
 
-func TestDeduplicatorExpiresEntries(t *testing.T) {
-	var dedup deduplicator
-	now := time.Now()
-	if !dedup.accept("telegram:1", now) || dedup.accept("telegram:1", now.Add(time.Second)) {
-		t.Fatal("deduplicator did not reject duplicate")
-	}
-	if !dedup.accept("telegram:1", now.Add(duplicateTTL+time.Second)) {
-		t.Fatal("deduplicator did not expire entry")
-	}
-}
-
 // This is the versioned contract emitted by RongxinAI's
 // CcConnectSidecarConfig serializer. The agent type is intentionally never
 // instantiated by this command; it only carries bridge control-plane options.

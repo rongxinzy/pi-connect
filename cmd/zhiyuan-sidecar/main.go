@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -28,7 +27,6 @@ import (
 
 const (
 	defaultTurnTimeout = 5 * time.Minute
-	duplicateTTL       = 10 * time.Minute
 )
 
 type bridgeClient struct {
@@ -122,29 +120,6 @@ func newRequestID() (string, error) {
 	return hex.EncodeToString(data), nil
 }
 
-type deduplicator struct {
-	mu      sync.Mutex
-	entries map[string]time.Time
-}
-
-func (d *deduplicator) accept(key string, now time.Time) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.entries == nil {
-		d.entries = make(map[string]time.Time)
-	}
-	for existing, expiresAt := range d.entries {
-		if !expiresAt.After(now) {
-			delete(d.entries, existing)
-		}
-	}
-	if _, exists := d.entries[key]; exists {
-		return false
-	}
-	d.entries[key] = now.Add(duplicateTTL)
-	return true
-}
-
 func main() {
 	configPath := os.Getenv("CC_CONNECT_CONFIG")
 	if strings.TrimSpace(configPath) == "" {
@@ -200,9 +175,8 @@ func main() {
 				fmt.Fprintf(os.Stderr, "project %q platform %q: %v\n", project.Name, platformConfig.Type, err)
 				os.Exit(2)
 			}
-			dedup := &deduplicator{}
 			if err := platform.Start(func(p core.Platform, msg *core.Message) {
-				if msg == nil || strings.TrimSpace(msg.MessageID) == "" || !dedup.accept(project.Name+":"+msg.Platform+":"+msg.MessageID, time.Now()) {
+				if msg == nil || strings.TrimSpace(msg.MessageID) == "" {
 					return
 				}
 				go func() {
