@@ -67,14 +67,14 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (b *bridgeClient) runTurn(ctx context.Context, project string, msg *core.Message) (string, error) {
+func (b *bridgeClient) runTurn(ctx context.Context, accountID string, msg *core.Message) (string, error) {
 	requestID, err := newRequestID()
 	if err != nil {
 		return "", err
 	}
 	body, err := json.Marshal(map[string]any{
 		"requestId": requestID,
-		"project":   project,
+		"accountId": accountID,
 		"message": map[string]any{
 			"sessionKey": msg.SessionKey, "platform": msg.Platform, "messageId": msg.MessageID,
 			"channelId": bridgeChannelID(msg), "userId": msg.UserID, "userName": msg.UserName,

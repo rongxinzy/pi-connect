@@ -24,7 +24,7 @@ import (
 // surface. ZhiYuan is the sole source of truth and reconciles registrations
 // after any sidecar restart.
 type cronController struct {
-	project    string
+	accountID  string
 	bridge     *bridgeClient
 	outboxPath string
 	mu         sync.Mutex
@@ -57,7 +57,7 @@ func newCronControllerRegistry(controllers []*cronController) *cronControllerReg
 	registry := &cronControllerRegistry{controllers: make(map[string]*cronController, len(controllers))}
 	for _, controller := range controllers {
 		if controller != nil {
-			registry.controllers[controller.project] = controller
+			registry.controllers[controller.accountID] = controller
 		}
 	}
 	return registry
@@ -70,7 +70,7 @@ func (r *cronControllerRegistry) resolve(accountID string) (*cronController, err
 	}
 	controller := r.controllers[accountID]
 	if controller == nil {
-		return nil, errors.New("configured project is unavailable")
+		return nil, errors.New("configured account is unavailable")
 	}
 	return controller, nil
 }
@@ -137,15 +137,15 @@ type cronSchedule struct {
 	Timezone string `json:"tz,omitempty"`
 }
 
-func newCronController(project string, bridge *bridgeClient, dataDirs ...string) *cronController {
+func newCronController(accountID string, bridge *bridgeClient, dataDirs ...string) *cronController {
 	controller := &cronController{
-		project: project,
-		bridge:  bridge,
-		jobs:    make(map[string]func()),
-		pending: make(map[string]pendingTrigger),
-		wake:    make(chan struct{}, 1),
-		stopCh:  make(chan struct{}),
-		done:    make(chan struct{}),
+		accountID: accountID,
+		bridge:    bridge,
+		jobs:      make(map[string]func()),
+		pending:   make(map[string]pendingTrigger),
+		wake:      make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	if len(dataDirs) > 0 && strings.TrimSpace(dataDirs[0]) != "" {
 		controller.outboxPath = filepath.Join(dataDirs[0], "zhiyuan-trigger-outbox")
@@ -332,7 +332,7 @@ func (c *cronController) register(request cronTaskRequest) (func(), error) {
 
 func (b *bridgeClient) triggerCron(
 	ctx context.Context,
-	project, taskID, scheduleVersion string,
+	accountID, taskID, scheduleVersion string,
 	scheduledAt time.Time,
 ) error {
 	requestID, err := newRequestID()
@@ -341,7 +341,7 @@ func (b *bridgeClient) triggerCron(
 	}
 	body, err := json.Marshal(map[string]string{
 		"requestId":       requestID,
-		"project":         project,
+		"accountId":       accountID,
 		"taskId":          taskID,
 		"scheduleVersion": scheduleVersion,
 		"scheduledAt":     scheduledAt.Format(time.RFC3339Nano),
@@ -425,7 +425,7 @@ func (c *cronController) deliverPending() {
 	c.mu.Unlock()
 	for _, trigger := range batch {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTurnTimeout)
-		err := c.bridge.triggerCron(ctx, c.project, trigger.TaskID, trigger.ScheduleVersion, trigger.ScheduledAt)
+		err := c.bridge.triggerCron(ctx, c.accountID, trigger.TaskID, trigger.ScheduleVersion, trigger.ScheduledAt)
 		cancel()
 		if err != nil {
 			fmt.Printf("cron trigger delivery failed task_id=%s: %v\n", trigger.TaskID, err)
