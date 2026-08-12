@@ -7,12 +7,20 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/chenhg5/cc-connect/config"
 	"github.com/chenhg5/cc-connect/core"
 )
+
+func authorizeTestRequest(request *http.Request, nonce string) {
+	request.Header.Set("Authorization", "Bearer secret")
+	request.Header.Set("X-ZhiYuan-Protocol-Version", zhiyuanProtocolVersion)
+	request.Header.Set("X-ZhiYuan-Timestamp-Ms", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	request.Header.Set("X-ZhiYuan-Nonce", nonce)
+}
 
 type deliveryPlatformStub struct{ sent string }
 
@@ -53,11 +61,14 @@ func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 	}
 
 	health := httptest.NewRequest(http.MethodGet, "/v1/cc-connect/cron/health", nil)
-	health.Header.Set("Authorization", "Bearer secret")
+	authorizeTestRequest(health, "health-nonce")
 	healthResponse := httptest.NewRecorder()
 	handler.ServeHTTP(healthResponse, health)
-	if healthResponse.Code != http.StatusNoContent {
+	if healthResponse.Code != http.StatusOK {
 		t.Fatalf("health status = %d", healthResponse.Code)
+	}
+	if !bytes.Contains(healthResponse.Body.Bytes(), []byte(`"protocolVersion":"1"`)) {
+		t.Fatalf("health body = %s", healthResponse.Body.String())
 	}
 
 	execPayload := httptest.NewRequest(
@@ -65,7 +76,7 @@ func TestCronControlRejectsUnauthenticatedAndExecPayloads(t *testing.T) {
 		"/v1/cc-connect/cron/tasks",
 		bytes.NewBufferString(`{"taskId":"a","scheduleVersion":"v1","schedule":{"kind":"cron","expr":"0 9 * * *"},"exec":"whoami"}`),
 	)
-	execPayload.Header.Set("Authorization", "Bearer secret")
+	authorizeTestRequest(execPayload, "exec-nonce")
 	execResponse := httptest.NewRecorder()
 	handler.ServeHTTP(execResponse, execPayload)
 	if execResponse.Code != http.StatusBadRequest {
@@ -81,7 +92,7 @@ func TestDeliveryControlUsesOnlyConfiguredProactivePlatform(t *testing.T) {
 	handler := cronControlHandler("secret", controller, sender)
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"platform":"telegram","sessionKey":"telegram:42","content":"done"}`))
-	request.Header.Set("Authorization", "Bearer secret")
+	authorizeTestRequest(request, "delivery-nonce")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusNoContent || platform.sent != "done" {
@@ -89,11 +100,29 @@ func TestDeliveryControlUsesOnlyConfiguredProactivePlatform(t *testing.T) {
 	}
 
 	bad := httptest.NewRequest(http.MethodPost, "/v1/cc-connect/deliver", bytes.NewBufferString(`{"platform":"telegram","sessionKey":"telegram:42","content":"done","exec":"whoami"}`))
-	bad.Header.Set("Authorization", "Bearer secret")
+	authorizeTestRequest(bad, "bad-delivery-nonce")
 	badResponse := httptest.NewRecorder()
 	handler.ServeHTTP(badResponse, bad)
 	if badResponse.Code != http.StatusBadRequest {
 		t.Fatalf("unknown delivery field status=%d", badResponse.Code)
+	}
+}
+
+func TestCronControlRejectsReplayedNonce(t *testing.T) {
+	controller := newCronController("project", &bridgeClient{})
+	handler := cronControlHandler("secret", controller, nil)
+	for attempt := 0; attempt < 2; attempt++ {
+		request := httptest.NewRequest(http.MethodGet, "/v1/cc-connect/cron/health", nil)
+		authorizeTestRequest(request, "same-nonce")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		want := http.StatusOK
+		if attempt == 1 {
+			want = http.StatusUnauthorized
+		}
+		if response.Code != want {
+			t.Fatalf("attempt %d status=%d want=%d", attempt, response.Code, want)
+		}
 	}
 }
 
@@ -116,6 +145,48 @@ func TestCronControllerValidatesTriggerOnlyRegistration(t *testing.T) {
 	}
 	controller.remove("interval")
 	controller.remove("once")
+}
+
+func TestCronControllerRecoversPastAtWithScheduledOccurrence(t *testing.T) {
+	controller := newCronController("project", &bridgeClient{}, t.TempDir())
+	scheduledAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	if err := controller.upsert(cronTaskRequest{TaskID: "once", ScheduleVersion: "v1", Schedule: cronSchedule{Kind: "at", At: scheduledAt.Format(time.RFC3339)}}); err != nil {
+		t.Fatalf("past at registration: %v", err)
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if len(controller.pending) != 1 {
+		t.Fatalf("pending count=%d", len(controller.pending))
+	}
+	for _, trigger := range controller.pending {
+		if !trigger.ScheduledAt.Equal(scheduledAt) {
+			t.Fatalf("scheduledAt=%s want=%s", trigger.ScheduledAt, scheduledAt)
+		}
+	}
+}
+
+func TestCronOutboxSurvivesRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	scheduledAt := time.Now().UTC().Truncate(time.Millisecond)
+	first := newCronController("project", &bridgeClient{}, dataDir)
+	first.trigger("task", "v1", scheduledAt)
+	second := newCronController("project", &bridgeClient{}, dataDir)
+	second.mu.Lock()
+	if err := second.loadOutboxLocked(); err != nil {
+		second.mu.Unlock()
+		t.Fatal(err)
+	}
+	if len(second.pending) != 1 {
+		second.mu.Unlock()
+		t.Fatalf("pending count=%d", len(second.pending))
+	}
+	for _, trigger := range second.pending {
+		if !trigger.ScheduledAt.Equal(scheduledAt) {
+			second.mu.Unlock()
+			t.Fatalf("scheduledAt=%s want=%s", trigger.ScheduledAt, scheduledAt)
+		}
+	}
+	second.mu.Unlock()
 }
 
 func TestDeduplicatorExpiresEntries(t *testing.T) {

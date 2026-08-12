@@ -3,13 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,10 +24,22 @@ import (
 // surface. ZhiYuan is the sole source of truth and reconciles registrations
 // after any sidecar restart.
 type cronController struct {
-	project string
-	bridge  *bridgeClient
-	mu      sync.Mutex
-	jobs    map[string]func()
+	project    string
+	bridge     *bridgeClient
+	outboxPath string
+	mu         sync.Mutex
+	jobs       map[string]func()
+	pending    map[string]pendingTrigger
+	wake       chan struct{}
+	stopCh     chan struct{}
+	done       chan struct{}
+	started    bool
+}
+
+type pendingTrigger struct {
+	TaskID          string    `json:"taskId"`
+	ScheduleVersion string    `json:"scheduleVersion"`
+	ScheduledAt     time.Time `json:"scheduledAt"`
 }
 
 type cronTaskRequest struct {
@@ -91,17 +105,47 @@ type cronSchedule struct {
 	Timezone string `json:"tz,omitempty"`
 }
 
-func newCronController(project string, bridge *bridgeClient) *cronController {
-	return &cronController{
+func newCronController(project string, bridge *bridgeClient, dataDirs ...string) *cronController {
+	controller := &cronController{
 		project: project,
 		bridge:  bridge,
 		jobs:    make(map[string]func()),
+		pending: make(map[string]pendingTrigger),
+		wake:    make(chan struct{}, 1),
+		stopCh:  make(chan struct{}),
+		done:    make(chan struct{}),
 	}
+	if len(dataDirs) > 0 && strings.TrimSpace(dataDirs[0]) != "" {
+		controller.outboxPath = filepath.Join(dataDirs[0], "zhiyuan-trigger-outbox")
+	}
+	return controller
 }
 
-func (c *cronController) start() {}
+func (c *cronController) start() {
+	c.mu.Lock()
+	if c.started {
+		c.mu.Unlock()
+		return
+	}
+	c.started = true
+	_ = c.loadOutboxLocked()
+	c.mu.Unlock()
+	go c.deliverLoop()
+	c.signalDelivery()
+}
 
-func (c *cronController) stop() context.Context { return context.Background() }
+func (c *cronController) stop() context.Context {
+	c.mu.Lock()
+	if !c.started {
+		c.mu.Unlock()
+		return context.Background()
+	}
+	c.started = false
+	close(c.stopCh)
+	c.mu.Unlock()
+	<-c.done
+	return context.Background()
+}
 
 func (c *cronController) upsert(request cronTaskRequest) error {
 	if strings.TrimSpace(request.TaskID) == "" || strings.TrimSpace(request.ScheduleVersion) == "" {
@@ -132,13 +176,20 @@ func (c *cronController) remove(taskID string) bool {
 	return true
 }
 
-func (c *cronController) trigger(taskID, version string) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTurnTimeout)
-	defer cancel()
-	if err := c.bridge.triggerCron(ctx, c.project, taskID, version, time.Now().UTC()); err != nil {
-		// ZhiYuan reconciliation is responsible for retry/backoff.
-		fmt.Printf("cron trigger failed task_id=%s: %v\n", taskID, err)
+func triggerIdentity(trigger pendingTrigger) string {
+	return trigger.TaskID + "\x00" + trigger.ScheduleVersion + "\x00" + trigger.ScheduledAt.UTC().Format(time.RFC3339Nano)
+}
+
+func (c *cronController) trigger(taskID, version string, scheduledAt time.Time) {
+	trigger := pendingTrigger{TaskID: taskID, ScheduleVersion: version, ScheduledAt: scheduledAt.UTC()}
+	c.mu.Lock()
+	identity := triggerIdentity(trigger)
+	if err := c.persistTriggerLocked(identity, trigger); err != nil {
+		fmt.Printf("persist cron trigger failed task_id=%s: %v\n", taskID, err)
 	}
+	c.pending[identity] = trigger
+	c.mu.Unlock()
+	c.signalDelivery()
 }
 
 func (c *cronController) register(request cronTaskRequest) (func(), error) {
@@ -177,7 +228,7 @@ func (c *cronController) register(request cronTaskRequest) (func(), error) {
 					// A monotonic timer that expires while the machine sleeps is
 					// delivered once on wake, intentionally recovering that missed
 					// cron occurrence before calculating the next one.
-					c.trigger(request.TaskID, request.ScheduleVersion)
+					c.trigger(request.TaskID, request.ScheduleVersion, next)
 				}
 			}
 		}()
@@ -188,7 +239,8 @@ func (c *cronController) register(request cronTaskRequest) (func(), error) {
 			return nil, errors.New("at must be RFC3339")
 		}
 		if !at.After(time.Now()) {
-			return nil, errors.New("at schedule must be in the future")
+			c.trigger(request.TaskID, request.ScheduleVersion, at)
+			return func() {}, nil
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
@@ -198,7 +250,7 @@ func (c *cronController) register(request cronTaskRequest) (func(), error) {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
-				c.trigger(request.TaskID, request.ScheduleVersion)
+				c.trigger(request.TaskID, request.ScheduleVersion, at)
 			}
 		}()
 		return cancel, nil
@@ -223,16 +275,20 @@ func (c *cronController) register(request cronTaskRequest) (func(), error) {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
-				c.trigger(request.TaskID, request.ScheduleVersion)
+				c.trigger(request.TaskID, request.ScheduleVersion, next)
 			}
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
 			for {
+				next = next.Add(interval)
+				for !next.After(time.Now()) {
+					next = next.Add(interval)
+				}
+				timer := time.NewTimer(time.Until(next))
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					return
-				case <-ticker.C:
-					c.trigger(request.TaskID, request.ScheduleVersion)
+				case <-timer.C:
+					c.trigger(request.TaskID, request.ScheduleVersion, next)
 				}
 			}
 		}()
@@ -267,7 +323,9 @@ func (b *bridgeClient) triggerCron(
 	}
 	request.Header.Set("Authorization", "Bearer "+b.token)
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-ZhiYuan-Request-ID", requestID)
+	if err := addProtocolHeaders(request, requestID); err != nil {
+		return err
+	}
 	response, err := b.client.Do(request)
 	if err != nil {
 		return err
@@ -304,9 +362,122 @@ func startCronControlServer(ctx context.Context, rawAddress, token string, contr
 	return "http://" + listener.Addr().String(), nil
 }
 
+func (c *cronController) signalDelivery() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *cronController) deliverLoop() {
+	defer close(c.done)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-c.wake:
+		case <-ticker.C:
+		}
+		c.deliverPending()
+	}
+}
+
+func (c *cronController) deliverPending() {
+	c.mu.Lock()
+	batch := make([]pendingTrigger, 0, len(c.pending))
+	for _, trigger := range c.pending {
+		batch = append(batch, trigger)
+	}
+	c.mu.Unlock()
+	for _, trigger := range batch {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTurnTimeout)
+		err := c.bridge.triggerCron(ctx, c.project, trigger.TaskID, trigger.ScheduleVersion, trigger.ScheduledAt)
+		cancel()
+		if err != nil {
+			fmt.Printf("cron trigger delivery failed task_id=%s: %v\n", trigger.TaskID, err)
+			continue
+		}
+		c.mu.Lock()
+		identity := triggerIdentity(trigger)
+		if err := c.removePersistedTriggerLocked(identity); err != nil {
+			fmt.Printf("persist cron trigger acknowledgment failed task_id=%s: %v\n", trigger.TaskID, err)
+			c.mu.Unlock()
+			continue
+		}
+		delete(c.pending, identity)
+		c.mu.Unlock()
+	}
+}
+
+func (c *cronController) loadOutboxLocked() error {
+	if c.outboxPath == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(c.outboxPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(c.outboxPath, entry.Name()))
+		if err != nil {
+			return err
+		}
+		var trigger pendingTrigger
+		if err := json.Unmarshal(data, &trigger); err != nil {
+			return err
+		}
+		c.pending[triggerIdentity(trigger)] = trigger
+	}
+	return nil
+}
+
+func (c *cronController) persistTriggerLocked(identity string, trigger pendingTrigger) error {
+	if c.outboxPath == "" {
+		return nil
+	}
+	data, err := json.Marshal(trigger)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(c.outboxPath, 0o700); err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(identity))
+	target := filepath.Join(c.outboxPath, fmt.Sprintf("%x.json", digest))
+	if _, err := os.Stat(target); err == nil {
+		return nil
+	}
+	temporary := target + ".tmp"
+	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(temporary, target)
+}
+
+func (c *cronController) removePersistedTriggerLocked(identity string) error {
+	if c.outboxPath == "" {
+		return nil
+	}
+	digest := sha256.Sum256([]byte(identity))
+	err := os.Remove(filepath.Join(c.outboxPath, fmt.Sprintf("%x.json", digest)))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 func cronControlHandler(token string, controller *cronController, sender *deliverySender) http.Handler {
+	authenticator := &requestAuthenticator{token: token}
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if !secureBearerMatch(request.Header.Get("Authorization"), token) {
+		if err := authenticator.authorize(request); err != nil {
 			response.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -314,7 +485,8 @@ func cronControlHandler(token string, controller *cronController, sender *delive
 		const deliveryPath = "/v1/cc-connect/deliver"
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/cc-connect/cron/health":
-			response.WriteHeader(http.StatusNoContent)
+			response.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(response).Encode(currentHealth())
 		case request.Method == http.MethodPost && request.URL.Path == taskPath:
 			decoder := json.NewDecoder(io.LimitReader(request.Body, 64<<10))
 			decoder.DisallowUnknownFields()
@@ -360,14 +532,4 @@ func cronControlHandler(token string, controller *cronController, sender *delive
 			response.WriteHeader(http.StatusNotFound)
 		}
 	})
-}
-
-func secureBearerMatch(value, token string) bool {
-	const prefix = "Bearer "
-	if !strings.HasPrefix(value, prefix) {
-		return false
-	}
-	provided := []byte(strings.TrimPrefix(value, prefix))
-	expected := []byte(token)
-	return len(provided) == len(expected) && subtle.ConstantTimeCompare(provided, expected) == 1
 }

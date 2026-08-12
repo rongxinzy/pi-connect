@@ -93,7 +93,9 @@ func (b *bridgeClient) runTurn(ctx context.Context, project string, msg *core.Me
 	}
 	request.Header.Set("Authorization", "Bearer "+b.token)
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-ZhiYuan-Request-ID", requestID)
+	if err := addProtocolHeaders(request, requestID); err != nil {
+		return "", fmt.Errorf("secure bridge request: %w", err)
+	}
 	response, err := b.client.Do(request)
 	if err != nil {
 		return "", fmt.Errorf("call ZhiYuan bridge: %w", err)
@@ -177,7 +179,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "project %q bridge configuration: cron_control_listen is required\n", project.Name)
 			os.Exit(2)
 		}
-		cronController := newCronController(project.Name, bridge)
+		cronController := newCronController(project.Name, bridge, cfg.DataDir)
 		cronController.start()
 		defer cronController.stop()
 		sender := &deliverySender{}
