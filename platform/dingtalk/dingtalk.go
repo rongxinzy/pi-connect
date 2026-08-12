@@ -187,40 +187,12 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.streamCtxCancel = cancel
 
-	// Run the stream in a restart loop. The SDK's processLoop() runs in a background
-	// goroutine and handles keepalive pings internally. If the goroutine exits
-	// (e.g. server closes idle connection), Start() returns and we attempt to reconnect.
-	// This ensures the bot stays connected even after long periods of silence.
-	go func() {
-		defer slog.Info("dingtalk: stream runner exited")
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						slog.Error("dingtalk: stream panic recovered, will reconnect",
-							"panic", r)
-					}
-				}()
-				if err := p.streamClient.Start(ctx); err != nil {
-					slog.Warn("dingtalk: stream disconnected, reconnecting", "error", err)
-				}
-			}()
-
-			// Brief pause before reconnecting to avoid tight loop on persistent failures.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(3 * time.Second):
-			}
-		}
-	}()
-
+	// The official SDK performs the endpoint request and WebSocket dial before
+	// Start returns, then owns its background read/reconnect loop.
+	if err := p.streamClient.Start(ctx); err != nil {
+		cancel()
+		return fmt.Errorf("dingtalk: stream connect: %w", err)
+	}
 	slog.Info("dingtalk: stream connected", "client_id", p.clientID)
 	return nil
 }

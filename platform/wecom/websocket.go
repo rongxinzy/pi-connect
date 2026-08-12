@@ -37,6 +37,7 @@ type WSPlatform struct {
 	reqSeq      atomic.Int64 // monotonic counter for generating unique req_id
 	missedPong  atomic.Int32 // consecutive heartbeat acks not received
 	pendingAcks sync.Map     // req_id -> chan wsAckResult, for sequential send with ack waiting
+	lifecycle   core.PlatformLifecycleHandler
 }
 
 const (
@@ -140,6 +141,12 @@ func (p *WSPlatform) generateReqID(prefix string) string {
 
 func (p *WSPlatform) Name() string { return "wecom" }
 
+func (p *WSPlatform) SetLifecycleHandler(handler core.PlatformLifecycleHandler) {
+	p.mu.Lock()
+	p.lifecycle = handler
+	p.mu.Unlock()
+}
+
 func (p *WSPlatform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())
@@ -170,6 +177,7 @@ func (p *WSPlatform) connectLoop() {
 			backoff = time.Second
 		}
 
+		p.notifyUnavailable(err)
 		slog.Warn("wecom-ws: connection lost, reconnecting", "error", err, "backoff", backoff)
 		select {
 		case <-time.After(backoff):
@@ -251,6 +259,7 @@ func (p *WSPlatform) runConnection() error {
 		return fmt.Errorf("subscribe failed: errcode=%d errmsg=%s", errCode, subResp.ErrMsg)
 	}
 	slog.Info("wecom-ws: subscribed successfully", "bot_id", p.botID)
+	p.notifyReady()
 	p.missedPong.Store(0)
 
 	// Start heartbeat goroutine
@@ -280,6 +289,26 @@ func (p *WSPlatform) runConnection() error {
 		p.handleFrame(frame)
 	}
 }
+
+func (p *WSPlatform) notifyReady() {
+	p.mu.Lock()
+	handler := p.lifecycle
+	p.mu.Unlock()
+	if handler != nil {
+		handler.OnPlatformReady(p)
+	}
+}
+
+func (p *WSPlatform) notifyUnavailable(err error) {
+	p.mu.Lock()
+	handler := p.lifecycle
+	p.mu.Unlock()
+	if handler != nil {
+		handler.OnPlatformUnavailable(p, err)
+	}
+}
+
+var _ core.AsyncRecoverablePlatform = (*WSPlatform)(nil)
 
 // handleFrame dispatches incoming frames by cmd or req_id prefix.
 func (p *WSPlatform) handleFrame(frame wsFrame) {
