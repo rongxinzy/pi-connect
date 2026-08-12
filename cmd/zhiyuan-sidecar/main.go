@@ -242,19 +242,32 @@ func main() {
 				go func() {
 					turnCtx, turnCancel := context.WithTimeout(ctx, defaultTurnTimeout)
 					defer turnCancel()
+					stopTyping := func() {}
+					if typing, ok := p.(core.TypingIndicator); ok {
+						stopTyping = typing.StartTyping(turnCtx, msg.ReplyCtx)
+					}
+					defer stopTyping()
 					content, err := configured.bridge.runTurn(turnCtx, configured.accountID, msg)
 					if err != nil {
-						slog.Error("ZhiYuan bridge turn failed", "project", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
-						_ = p.Reply(context.Background(), msg.ReplyCtx, "暂时无法处理这条消息，请稍后重试。")
+						slog.Error("ZhiYuan bridge turn failed", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
+						replyCtx, replyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+						defer replyCancel()
+						if replyErr := p.Reply(replyCtx, msg.ReplyCtx, "暂时无法处理这条消息，请稍后重试。"); replyErr != nil {
+							slog.Error("send channel fallback reply", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", replyErr)
+						}
 						return
 					}
-					if err := p.Reply(context.Background(), msg.ReplyCtx, content); err != nil {
-						slog.Error("send channel reply", "project", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
+					replyCtx, replyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer replyCancel()
+					if err := p.Reply(replyCtx, msg.ReplyCtx, content); err != nil {
+						slog.Error("send channel reply", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
+					} else {
+						slog.Info("channel reply sent", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID)
 					}
 				}()
 			}); err != nil {
 				platformStatuses.set(configured.accountID, configured.platform.Name(), platformStateUnavailable, err)
-				slog.Error("start channel platform", "project", configured.accountID, "platform", configured.platform.Name(), "error", err)
+				slog.Error("start channel platform", "account_id", configured.accountID, "platform", configured.platform.Name(), "error", err)
 				return
 			}
 			if !configured.isAsync {
