@@ -1,0 +1,89 @@
+name: Release ZhiYuan sidecar
+
+on:
+  push:
+    tags:
+      - 'zhiyuan-sidecar-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zhiyuan-sidecar-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          go test ./cmd/zhiyuan-sidecar
+          bash tools/verify-zhiyuan-sidecar-boundary.sh
+
+      - name: Build platform binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/zhiyuan-sidecar
+          build() {
+            local goos="$1"
+            local goarch="$2"
+            local output="$3"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags='-s -w' \
+                -o "dist/zhiyuan-sidecar/$output" ./cmd/zhiyuan-sidecar
+          }
+          build windows amd64 cc-connect-sidecar-windows-amd64.exe
+          build darwin amd64 cc-connect-sidecar-darwin-amd64
+          build darwin arm64 cc-connect-sidecar-darwin-arm64
+          build linux amd64 cc-connect-sidecar-linux-amd64
+
+      - name: Generate immutable release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist/zhiyuan-sidecar
+          sha256sum cc-connect-sidecar-* > checksums.txt
+          jq -n \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg revision "$GITHUB_SHA" \
+            --rawfile checksums checksums.txt \
+            '{
+              schemaVersion: 1,
+              sourceRepository: "https://github.com/rongxinzy/pi-connect",
+              tag: $tag,
+              sourceRevision: $revision,
+              sha256: (
+                $checksums
+                | split("\n")
+                | map(select(length > 0) | split("  "))
+                | map({key: .[1], value: .[0]})
+                | from_entries
+              )
+            }' > runtime-manifest.json
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            dist/zhiyuan-sidecar/* \
+            --verify-tag \
+            --title "ZhiYuan sidecar ${GITHUB_REF_NAME#zhiyuan-sidecar-}" \
+            --generate-notes
