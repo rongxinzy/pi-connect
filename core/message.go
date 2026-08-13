@@ -346,6 +346,7 @@ type Message struct {
 	UserID       string
 	UserName     string
 	ChatName     string // human-readable chat/group name (optional)
+	ChatType     string // "direct" or "group" when the platform can determine it
 	Content      string
 	Images       []ImageAttachment   // attached images (if any)
 	Files        []FileAttachment    // attached files (if any)

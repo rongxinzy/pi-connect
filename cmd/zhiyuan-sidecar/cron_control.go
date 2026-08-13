@@ -87,6 +87,7 @@ type deliveryRequest struct {
 type deliverySender struct {
 	mu        sync.RWMutex
 	platforms map[string]core.Platform
+	statuses  *platformStatusRegistry
 }
 
 func (s *deliverySender) register(accountID string, platform core.Platform) {
@@ -118,6 +119,9 @@ func (s *deliverySender) send(request deliveryRequest) error {
 	}
 	if err := platform.Send(context.Background(), replyCtx, request.Content); err != nil {
 		return fmt.Errorf("send delivery: %w", err)
+	}
+	if s.statuses != nil {
+		s.statuses.markOutbound(request.AccountID, platform.Name())
 	}
 	return nil
 }

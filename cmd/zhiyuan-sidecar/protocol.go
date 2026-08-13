@@ -100,7 +100,7 @@ func currentHealth(statuses *platformStatusRegistry) healthResponse {
 		ProtocolVersion: zhiyuanProtocolVersion,
 		PID:             os.Getpid(),
 		ParentPID:       os.Getppid(),
-		Capabilities:    []string{"channel-transport", "delivery", "trigger-only-cron"},
+		Capabilities:    []string{"channel-transport", "channel-policy", "media-reply", "runtime-activity", "delivery", "trigger-only-cron"},
 		Platforms:       platforms,
 	}
 }

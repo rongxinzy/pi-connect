@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -15,10 +16,13 @@ const (
 )
 
 type platformRuntimeStatus struct {
-	AccountID string `json:"accountId"`
-	Platform  string `json:"platform"`
-	State     string `json:"state"`
-	LastError string `json:"lastError,omitempty"`
+	AccountID      string `json:"accountId"`
+	Platform       string `json:"platform"`
+	State          string `json:"state"`
+	LastError      string `json:"lastError,omitempty"`
+	StartedAt      string `json:"startedAt,omitempty"`
+	LastInboundAt  string `json:"lastInboundAt,omitempty"`
+	LastOutboundAt string `json:"lastOutboundAt,omitempty"`
 }
 
 type platformStatusRegistry struct {
@@ -31,16 +35,48 @@ func newPlatformStatusRegistry() *platformStatusRegistry {
 }
 
 func (r *platformStatusRegistry) set(accountID, platform, state string, err error) {
+	key := deliveryPlatformKey(strings.TrimSpace(accountID), strings.TrimSpace(platform))
+	r.mu.Lock()
+	previous := r.statuses[key]
 	status := platformRuntimeStatus{
-		AccountID: strings.TrimSpace(accountID),
-		Platform:  strings.TrimSpace(platform),
-		State:     state,
+		AccountID:      strings.TrimSpace(accountID),
+		Platform:       strings.TrimSpace(platform),
+		State:          state,
+		StartedAt:      previous.StartedAt,
+		LastInboundAt:  previous.LastInboundAt,
+		LastOutboundAt: previous.LastOutboundAt,
+	}
+	if state == platformStateReady && previous.State != platformStateReady {
+		status.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	if err != nil {
 		status.LastError = err.Error()
 	}
+	r.statuses[key] = status
+	r.mu.Unlock()
+}
+
+func (r *platformStatusRegistry) markInbound(accountID, platform string) {
+	r.markActivity(accountID, platform, true)
+}
+
+func (r *platformStatusRegistry) markOutbound(accountID, platform string) {
+	r.markActivity(accountID, platform, false)
+}
+
+func (r *platformStatusRegistry) markActivity(accountID, platform string, inbound bool) {
+	key := deliveryPlatformKey(strings.TrimSpace(accountID), strings.TrimSpace(platform))
 	r.mu.Lock()
-	r.statuses[deliveryPlatformKey(status.AccountID, status.Platform)] = status
+	status, ok := r.statuses[key]
+	if ok {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if inbound {
+			status.LastInboundAt = now
+		} else {
+			status.LastOutboundAt = now
+		}
+		r.statuses[key] = status
+	}
 	r.mu.Unlock()
 }
 

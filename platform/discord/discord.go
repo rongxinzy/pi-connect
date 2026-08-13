@@ -40,6 +40,13 @@ type interactionReplyCtx struct {
 	firstDone   bool
 }
 
+func discordChatType(guildID string) string {
+	if guildID == "" {
+		return "direct"
+	}
+	return "group"
+}
+
 type progressPlatform struct {
 	*Platform
 }
@@ -679,6 +686,7 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			UserID:    m.Author.ID, UserName: m.Author.Username,
 			Content: m.Content, Images: images, Files: files, Audio: audio, ReplyCtx: rctx,
 		}
+		msg.ChatType = discordChatType(m.GuildID)
 		msg.ChatName, _ = p.ResolveChannelName(m.ChannelID)
 		p.dispatchMessage(msg)
 	})
@@ -848,7 +856,8 @@ func (p *Platform) handleInteraction(s *discordgo.Session, i *discordgo.Interact
 		MessageID: i.ID,
 		ChannelID: i.ChannelID,
 		UserID:    userID, UserName: userName,
-		Content:  cmdText, ReplyCtx: rctx,
+		Content: cmdText, ReplyCtx: rctx,
+		ChatType: discordChatType(i.GuildID),
 	}
 	msg.ChatName, _ = p.ResolveChannelName(channelID)
 	p.dispatchMessage(msg)
@@ -930,6 +939,7 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 		UserName:   userName,
 		Content:    command,
 		ChatName:   chatName,
+		ChatType:   discordChatType(i.GuildID),
 		ReplyCtx:   rc,
 	})
 }

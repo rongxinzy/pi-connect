@@ -19,6 +19,15 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
+func TestTelegramChatTypeUsesNativeChatType(t *testing.T) {
+	if got := telegramChatType(models.ChatTypePrivate); got != "direct" {
+		t.Fatalf("private chat type = %q", got)
+	}
+	if got := telegramChatType(models.ChatTypeSupergroup); got != "group" {
+		t.Fatalf("supergroup chat type = %q", got)
+	}
+}
+
 type testLifecycleHandler struct {
 	onReady       func(core.Platform)
 	onUnavailable func(core.Platform, error)
@@ -1035,4 +1044,3 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 		t.Fatalf("ProgressStyle() = %q, want compact", got)
 	}
 }
-

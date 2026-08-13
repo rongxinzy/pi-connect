@@ -21,6 +21,15 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
+func TestFeishuChatTypeUsesNativeChatType(t *testing.T) {
+	if got := feishuChatType("p2p"); got != "direct" {
+		t.Fatalf("p2p chat type = %q", got)
+	}
+	if got := feishuChatType("group"); got != "group" {
+		t.Fatalf("group chat type = %q", got)
+	}
+}
+
 func TestNew_DefaultsToInteractivePlatform(t *testing.T) {
 	p, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret"})
 	if err != nil {

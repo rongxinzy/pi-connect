@@ -553,6 +553,15 @@ func TestSendFile_SendsChannelAttachment(t *testing.T) {
 	}
 }
 
+func TestDiscordChatTypeUsesGuildIdentity(t *testing.T) {
+	if got := discordChatType(""); got != "direct" {
+		t.Fatalf("DM chat type = %q", got)
+	}
+	if got := discordChatType("guild-1"); got != "group" {
+		t.Fatalf("guild chat type = %q", got)
+	}
+}
+
 func TestSendFile_UsesInteractionEndpoints(t *testing.T) {
 	requests := make([]string, 0, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1696,4 +1705,3 @@ func basePlatformFor(t *testing.T, pAny core.Platform) *Platform {
 		return nil
 	}
 }
-

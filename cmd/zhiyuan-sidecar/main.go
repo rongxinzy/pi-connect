@@ -27,6 +27,7 @@ import (
 
 const (
 	defaultTurnTimeout = 5 * time.Minute
+	defaultMediaMaxMB  = 100
 )
 
 type bridgeClient struct {
@@ -67,10 +68,10 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (b *bridgeClient) runTurn(ctx context.Context, accountID string, msg *core.Message) (string, error) {
+func (b *bridgeClient) runTurn(ctx context.Context, accountID string, msg *core.Message) (bridgeTurnResponse, error) {
 	requestID, err := newRequestID()
 	if err != nil {
-		return "", err
+		return bridgeTurnResponse{}, err
 	}
 	body, err := json.Marshal(map[string]any{
 		"requestId": requestID,
@@ -78,38 +79,38 @@ func (b *bridgeClient) runTurn(ctx context.Context, accountID string, msg *core.
 		"message": map[string]any{
 			"sessionKey": msg.SessionKey, "platform": msg.Platform, "messageId": msg.MessageID,
 			"channelId": bridgeChannelID(msg), "userId": msg.UserID, "userName": msg.UserName,
-			"chatName": msg.ChatName, "content": msg.Content, "extraContent": msg.ExtraContent,
-			"images": msg.Images, "files": msg.Files, "userMessageTimeMs": msg.UserMessageTimeMs,
+			"chatName": msg.ChatName, "chatType": channelChatType(msg), "content": msg.Content, "extraContent": msg.ExtraContent,
+			"images": msg.Images, "files": msg.Files, "audio": msg.Audio, "userMessageTimeMs": msg.UserMessageTimeMs,
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("encode bridge turn: %w", err)
+		return bridgeTurnResponse{}, fmt.Errorf("encode bridge turn: %w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint("/v1/cc-connect/turn"), bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("build bridge request: %w", err)
+		return bridgeTurnResponse{}, fmt.Errorf("build bridge request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+b.token)
 	request.Header.Set("Content-Type", "application/json")
 	if err := addProtocolHeaders(request, requestID); err != nil {
-		return "", fmt.Errorf("secure bridge request: %w", err)
+		return bridgeTurnResponse{}, fmt.Errorf("secure bridge request: %w", err)
 	}
 	response, err := b.client.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("call ZhiYuan bridge: %w", err)
+		return bridgeTurnResponse{}, fmt.Errorf("call ZhiYuan bridge: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ZhiYuan bridge returned HTTP %d", response.StatusCode)
+		return bridgeTurnResponse{}, fmt.Errorf("ZhiYuan bridge returned HTTP %d", response.StatusCode)
 	}
-	var result struct{ Content string }
+	var result bridgeTurnResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode bridge response: %w", err)
+		return bridgeTurnResponse{}, fmt.Errorf("decode bridge response: %w", err)
 	}
-	if strings.TrimSpace(result.Content) == "" {
-		return "", errors.New("ZhiYuan bridge returned an empty response")
+	if strings.TrimSpace(result.Content) == "" && len(result.Attachments) == 0 {
+		return bridgeTurnResponse{}, errors.New("ZhiYuan bridge returned an empty response")
 	}
-	return result.Content, nil
+	return result, nil
 }
 
 func bridgeChannelID(msg *core.Message) string {
@@ -123,10 +124,12 @@ func bridgeChannelID(msg *core.Message) string {
 }
 
 type configuredPlatform struct {
-	accountID string
-	platform  core.Platform
-	bridge    *bridgeClient
-	isAsync   bool
+	accountID     string
+	platform      core.Platform
+	bridge        *bridgeClient
+	isAsync       bool
+	policy        channelPolicy
+	mediaMaxBytes int64
 }
 
 func newRequestID() (string, error) {
@@ -171,8 +174,8 @@ func main() {
 	}()
 	var controlListen string
 	var controlToken string
-	controlSender := &deliverySender{}
 	platformStatuses := newPlatformStatusRegistry()
+	controlSender := &deliverySender{statuses: platformStatuses}
 	var configuredPlatforms []configuredPlatform
 	for _, project := range cfg.Projects {
 		bridgeURL, _ := project.Agent.Options["bridge_url"].(string)
@@ -214,10 +217,12 @@ func main() {
 				async.SetLifecycleHandler(&projectPlatformLifecycle{accountID: project.Name, statuses: platformStatuses})
 			}
 			configuredPlatforms = append(configuredPlatforms, configuredPlatform{
-				accountID: project.Name,
-				platform:  platform,
-				bridge:    bridge,
-				isAsync:   isAsync,
+				accountID:     project.Name,
+				platform:      platform,
+				bridge:        bridge,
+				isAsync:       isAsync,
+				policy:        channelPolicyFromOptions(options),
+				mediaMaxBytes: mediaMaxBytesFromOptions(options),
 			})
 			platforms = append(platforms, platform)
 		}
@@ -239,6 +244,11 @@ func main() {
 				if msg == nil || strings.TrimSpace(msg.MessageID) == "" {
 					return
 				}
+				if !configured.policy.permits(msg) {
+					slog.Warn("channel message rejected by policy", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID)
+					return
+				}
+				platformStatuses.markInbound(configured.accountID, p.Name())
 				go func() {
 					turnCtx, turnCancel := context.WithTimeout(ctx, defaultTurnTimeout)
 					defer turnCancel()
@@ -247,7 +257,11 @@ func main() {
 						stopTyping = typing.StartTyping(turnCtx, msg.ReplyCtx)
 					}
 					defer stopTyping()
-					content, err := configured.bridge.runTurn(turnCtx, configured.accountID, msg)
+					if err := validateInboundMedia(msg, configured.mediaMaxBytes); err != nil {
+						slog.Warn("channel media rejected", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
+						return
+					}
+					result, err := configured.bridge.runTurn(turnCtx, configured.accountID, msg)
 					if err != nil {
 						slog.Error("ZhiYuan bridge turn failed", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
 						replyCtx, replyCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -259,9 +273,10 @@ func main() {
 					}
 					replyCtx, replyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer replyCancel()
-					if err := p.Reply(replyCtx, msg.ReplyCtx, content); err != nil {
+					if err := sendBridgeTurnResponse(replyCtx, p, msg.ReplyCtx, result); err != nil {
 						slog.Error("send channel reply", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID, "error", err)
 					} else {
+						platformStatuses.markOutbound(configured.accountID, p.Name())
 						slog.Info("channel reply sent", "account_id", configured.accountID, "platform", p.Name(), "message_id", msg.MessageID)
 					}
 				}()
