@@ -582,6 +582,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 }
 
 func (p *Platform) dispatchMessage(msg *core.Message, tgMsg *models.Message) {
+	msg.ChatType = telegramChatType(tgMsg.Chat.Type)
 	// Enrich with platform-specific context (reply quotes, location text, etc.)
 	var extras []string
 	if replyText := enrichReplyContent(tgMsg); replyText != "" {
@@ -605,6 +606,13 @@ func (p *Platform) dispatchMessage(msg *core.Message, tgMsg *models.Message) {
 		return
 	}
 	handler(p, msg)
+}
+
+func telegramChatType(chatType models.ChatType) string {
+	if chatType == models.ChatTypeGroup || chatType == models.ChatTypeSupergroup {
+		return "group"
+	}
+	return "direct"
 }
 
 func (p *Platform) messageHandler() core.MessageHandler {

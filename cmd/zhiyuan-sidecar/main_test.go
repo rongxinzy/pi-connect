@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,8 +32,11 @@ func (p *deliveryPlatformStub) Name() string {
 	}
 	return "telegram"
 }
-func (p *deliveryPlatformStub) Start(core.MessageHandler) error          { return nil }
-func (p *deliveryPlatformStub) Reply(context.Context, any, string) error { return nil }
+func (p *deliveryPlatformStub) Start(core.MessageHandler) error { return nil }
+func (p *deliveryPlatformStub) Reply(_ context.Context, _ any, content string) error {
+	p.sent = content
+	return nil
+}
 func (p *deliveryPlatformStub) Send(_ context.Context, _ any, content string) error {
 	p.sent = content
 	return nil
@@ -39,6 +44,141 @@ func (p *deliveryPlatformStub) Send(_ context.Context, _ any, content string) er
 func (p *deliveryPlatformStub) Stop() error { return nil }
 func (p *deliveryPlatformStub) ReconstructReplyCtx(sessionKey string) (any, error) {
 	return sessionKey, nil
+}
+
+type mediaPlatformStub struct {
+	deliveryPlatformStub
+	images []core.ImageAttachment
+	files  []core.FileAttachment
+}
+
+func (p *mediaPlatformStub) SendImage(_ context.Context, _ any, image core.ImageAttachment) error {
+	p.images = append(p.images, image)
+	return nil
+}
+
+func (p *mediaPlatformStub) SendFile(_ context.Context, _ any, file core.FileAttachment) error {
+	p.files = append(p.files, file)
+	return nil
+}
+
+func TestChannelPolicySeparatesDirectAndGroupAccess(t *testing.T) {
+	policy := channelPolicy{
+		dmPolicy: policyDisabled, groupPolicy: policyAllow, groupAllowFrom: "group-1",
+	}
+	if policy.permits(&core.Message{ChatType: chatTypeDirect, UserID: "user-1"}) {
+		t.Fatal("disabled direct messages must be rejected")
+	}
+	if !policy.permits(&core.Message{ChatType: chatTypeGroup, ChannelID: "group-1", UserID: "user-1"}) {
+		t.Fatal("allowlisted group must be accepted")
+	}
+	if policy.permits(&core.Message{ChatType: chatTypeGroup, ChannelID: "group-2", UserID: "user-1"}) {
+		t.Fatal("non-allowlisted group must be rejected")
+	}
+}
+
+func TestChannelChatTypeDoesNotTreatWeComDirectChatIDAsGroup(t *testing.T) {
+	direct := &core.Message{Platform: "wecom", SessionKey: "wecom:external-chat-id:user-1", UserID: "user-1"}
+	if got := channelChatType(direct); got != chatTypeDirect {
+		t.Fatalf("WeCom direct chat type = %q", got)
+	}
+	group := &core.Message{Platform: "wecom", SessionKey: "wecom:group-1:user-1", UserID: "user-1", ChatName: "Group"}
+	if got := channelChatType(group); got != chatTypeGroup {
+		t.Fatalf("WeCom group chat type = %q", got)
+	}
+}
+
+func TestPairingPolicyFailsClosedWithoutAuthorizedIdentity(t *testing.T) {
+	policy := channelPolicy{dmPolicy: policyPairing}
+	if policy.permits(&core.Message{ChatType: chatTypeDirect, UserID: "user-1"}) {
+		t.Fatal("pairing without an approved identity must fail closed")
+	}
+	policy.dmAllowFrom = "user-1"
+	if !policy.permits(&core.Message{ChatType: chatTypeDirect, UserID: "user-1"}) {
+		t.Fatal("approved pairing identity must be accepted")
+	}
+}
+
+func TestUnknownChannelPolicyFailsClosed(t *testing.T) {
+	policy := channelPolicy{dmPolicy: "typo"}
+	if policy.permits(&core.Message{ChatType: chatTypeDirect, UserID: "user-1"}) {
+		t.Fatal("unknown policy value must fail closed")
+	}
+}
+
+func TestInboundMediaLimitUsesConfiguredMegabytes(t *testing.T) {
+	limit := mediaMaxBytesFromOptions(map[string]any{"media_max_mb": int64(1)})
+	if limit != 1<<20 {
+		t.Fatalf("media limit = %d", limit)
+	}
+	message := &core.Message{Images: []core.ImageAttachment{{Data: make([]byte, limit+1)}}}
+	if err := validateInboundMedia(message, limit); err == nil {
+		t.Fatal("oversized inbound media was accepted")
+	}
+}
+
+func TestSendBridgeTurnResponseDeliversTextAndAttachments(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "chart.png")
+	filePath := filepath.Join(dir, "report.txt")
+	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filePath, []byte("report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	platform := &mediaPlatformStub{}
+	err := sendBridgeTurnResponse(context.Background(), platform, nil, bridgeTurnResponse{
+		Content:     "done",
+		Attachments: []bridgeAttachment{{Kind: "image", Path: imagePath}, {Kind: "file", Path: filePath}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if platform.sent != "done" || len(platform.images) != 1 || len(platform.files) != 1 {
+		t.Fatalf("unexpected bridge delivery text=%q images=%d files=%d", platform.sent, len(platform.images), len(platform.files))
+	}
+}
+
+func TestSendBridgeAttachmentRejectsRelativeAndLinkedPaths(t *testing.T) {
+	platform := &mediaPlatformStub{}
+	if err := sendBridgeAttachment(context.Background(), platform, nil, bridgeAttachment{Kind: "file", Path: "relative.txt"}); err == nil {
+		t.Fatal("relative path was accepted")
+	}
+	target := filepath.Join(t.TempDir(), "target.txt")
+	link := filepath.Join(filepath.Dir(target), "link.txt")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err == nil {
+		if err := sendBridgeAttachment(context.Background(), platform, nil, bridgeAttachment{Kind: "file", Path: link}); err == nil || !strings.Contains(err.Error(), "not a link") {
+			t.Fatalf("linked path result = %v", err)
+		}
+	}
+}
+
+func TestPlatformStatusTracksReadyAndActivity(t *testing.T) {
+	statuses := newPlatformStatusRegistry()
+	statuses.set("account", "telegram", platformStateReady, nil)
+	statuses.markInbound("account", "telegram")
+	statuses.markOutbound("account", "telegram")
+	status := statuses.snapshot()[0]
+	if status.StartedAt == "" || status.LastInboundAt == "" || status.LastOutboundAt == "" {
+		t.Fatalf("missing activity timestamps: %#v", status)
+	}
+}
+
+func TestPlatformStatusRefreshesStartedAtAfterReconnect(t *testing.T) {
+	statuses := newPlatformStatusRegistry()
+	statuses.set("account", "telegram", platformStateReady, nil)
+	first := statuses.snapshot()[0].StartedAt
+	statuses.set("account", "telegram", platformStateUnavailable, errors.New("connection lost"))
+	time.Sleep(time.Millisecond)
+	statuses.set("account", "telegram", platformStateReady, nil)
+	second := statuses.snapshot()[0]
+	if second.StartedAt == first || second.LastError != "" {
+		t.Fatalf("reconnect status was not refreshed: %#v", second)
+	}
 }
 
 func TestBridgeOnlyAcceptsLoopbackEndpoints(t *testing.T) {
@@ -114,7 +254,9 @@ func TestDeliveryControlUsesOnlyConfiguredProactivePlatform(t *testing.T) {
 }
 
 func TestDeliverySenderRoutesByAccountAndPlatform(t *testing.T) {
-	sender := &deliverySender{}
+	statuses := newPlatformStatusRegistry()
+	statuses.set("second", "dingtalk", platformStateReady, nil)
+	sender := &deliverySender{statuses: statuses}
 	first := &deliveryPlatformStub{name: "dingtalk"}
 	second := &deliveryPlatformStub{name: "dingtalk"}
 	sender.register("first", first)
@@ -124,6 +266,9 @@ func TestDeliverySenderRoutesByAccountAndPlatform(t *testing.T) {
 	}
 	if first.sent != "" || second.sent != "hello" {
 		t.Fatalf("unexpected routing first=%q second=%q", first.sent, second.sent)
+	}
+	if statuses.snapshot()[0].LastOutboundAt == "" {
+		t.Fatal("proactive delivery did not update outbound activity")
 	}
 }
 

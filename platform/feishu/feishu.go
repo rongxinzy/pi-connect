@@ -115,6 +115,7 @@ type replyContext struct {
 	messageID  string
 	chatID     string
 	sessionKey string
+	chatType   string
 }
 
 type Platform struct {
@@ -1143,11 +1144,24 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 		return
 	}
 	p.populateWorkspaceChannelKeys(msg)
+	if rctx, ok := msg.ReplyCtx.(replyContext); ok {
+		msg.ChatType = feishuChatType(rctx.chatType)
+	}
 	if p.isMessageRecalled(msg.MessageID) {
 		slog.Debug(p.tag()+": recalled message dispatch dropped", "message_id", msg.MessageID)
 		return
 	}
 	h(p.dispatchPlatform(), msg)
+}
+
+func feishuChatType(chatType string) string {
+	if chatType == "group" {
+		return "group"
+	}
+	if chatType == "" {
+		return ""
+	}
+	return "direct"
 }
 
 // populateWorkspaceChannelKeys keeps workspace binding scope aligned with the
@@ -1456,7 +1470,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, chatType: chatType}
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
