@@ -61,7 +61,7 @@ func sendBridgeAttachment(ctx context.Context, platform core.Platform, replyCtx 
 	if err != nil {
 		return fmt.Errorf("open bridge attachment: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("inspect open bridge attachment: %w", err)
