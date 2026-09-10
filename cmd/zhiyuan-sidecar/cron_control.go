@@ -104,7 +104,13 @@ func (s *deliverySender) send(request deliveryRequest) error {
 		return errors.New("accountId, platform, sessionKey, and content are required")
 	}
 	s.mu.RLock()
-	platform := s.platforms[deliveryPlatformKey(request.AccountID, request.Platform)]
+	var platform core.Platform
+	for _, name := range deliveryPlatformAliases(request.Platform) {
+		if candidate := s.platforms[deliveryPlatformKey(request.AccountID, name)]; candidate != nil {
+			platform = candidate
+			break
+		}
+	}
 	s.mu.RUnlock()
 	if platform == nil {
 		return errors.New("configured platform is unavailable")
@@ -128,6 +134,22 @@ func (s *deliverySender) send(request deliveryRequest) error {
 
 func deliveryPlatformKey(accountID, platform string) string {
 	return strings.TrimSpace(accountID) + "\x00" + strings.TrimSpace(platform)
+}
+
+// deliveryPlatformAliases lists the names a requested platform may be
+// registered under, exact name first. The control plane addresses feishu and
+// lark tenants with one channel name while accounts register their own domain
+// variant, so a lark-domain account would otherwise be unreachable for
+// proactive delivery.
+func deliveryPlatformAliases(platform string) []string {
+	switch strings.TrimSpace(platform) {
+	case "feishu":
+		return []string{"feishu", "lark"}
+	case "lark":
+		return []string{"lark", "feishu"}
+	default:
+		return []string{strings.TrimSpace(platform)}
+	}
 }
 
 // cronSchedule is a trigger-only schedule description. It deliberately has

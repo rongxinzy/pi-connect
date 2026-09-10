@@ -272,6 +272,29 @@ func TestDeliverySenderRoutesByAccountAndPlatform(t *testing.T) {
 	}
 }
 
+func TestDeliverySenderResolvesPlatformAliases(t *testing.T) {
+	// The control plane addresses lark-domain accounts with the canonical
+	// feishu channel name, so delivery must resolve the domain variant.
+	sender := &deliverySender{}
+	lark := &deliveryPlatformStub{name: "lark"}
+	sender.register("account", lark)
+	if err := sender.send(deliveryRequest{AccountID: "account", Platform: "feishu", SessionKey: "lark:chat:user", Content: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if lark.sent != "hello" {
+		t.Fatalf("lark platform did not receive delivery: %q", lark.sent)
+	}
+
+	feishu := &deliveryPlatformStub{name: "feishu"}
+	sender.register("other", feishu)
+	if err := sender.send(deliveryRequest{AccountID: "other", Platform: "lark", SessionKey: "feishu:chat:user", Content: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if feishu.sent != "hi" {
+		t.Fatalf("feishu platform did not receive delivery: %q", feishu.sent)
+	}
+}
+
 func TestCronControlRejectsReplayedNonce(t *testing.T) {
 	controller := newCronController("project", &bridgeClient{})
 	handler := cronControlHandler("secret", newCronControllerRegistry([]*cronController{controller}), nil, nil)
