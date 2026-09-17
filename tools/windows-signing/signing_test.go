@@ -14,6 +14,10 @@ func TestSidecarReleaseSignsBeforeChecksums(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := string(data)
+	publish := workflow[strings.Index(workflow, "  publish:"):]
+	if !strings.Contains(publish, "actions/checkout@v6") {
+		t.Fatal("Publication must check out the repository so GitHub CLI can resolve its target")
+	}
 	for _, required := range []string{"needs: [build, sign-windows]", "environment: release", "setup-certum-signing", "tools/windows-signing/sign-runtime.ps1", "name: signed-windows-sidecar"} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Missing signing boundary: %s", required)

@@ -47,4 +47,4 @@ Expect-Rejection { Assert-WindowsRuntimeSignature $fixture $trusted } 'trusted t
 $script:timestamp = [pscustomobject]@{ Subject = 'Timestamp authority' }
 $script:eku = '1.3.6.1.5.5.7.3.1'
 Expect-Rejection { Assert-WindowsRuntimeSignature $fixture $trusted } 'code signing'
-Write-Output 'Runtime Authenticode policy tests passed (11 cases).'
+Write-Output 'Runtime Authenticode policy tests passed (12 cases).'
