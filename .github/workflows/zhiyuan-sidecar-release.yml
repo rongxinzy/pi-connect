@@ -6,14 +6,14 @@ on:
       - 'zhiyuan-sidecar-v*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: zhiyuan-sidecar-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -52,11 +52,65 @@ jobs:
           build darwin arm64 cc-connect-sidecar-darwin-arm64
           build linux amd64 cc-connect-sidecar-linux-amd64
 
+      - uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-sidecar-binaries
+          path: dist/zhiyuan-sidecar/cc-connect-sidecar-*
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-windows:
+    needs: build
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: unsigned-sidecar-binaries
+          path: dist/zhiyuan-sidecar
+      - name: Connect Certum SimplySign
+        id: certum
+        uses: ./.github/actions/setup-certum-signing
+        with:
+          user-id: ${{ secrets.CERTUM_USER_ID }}
+          otp-uri: ${{ secrets.CERTUM_OTP_URI }}
+          certificate-thumbprint: ${{ secrets.CERTUM_CERT_THUMBPRINT }}
+      - name: Sign and verify Windows sidecar before checksums
+        shell: pwsh
+        env:
+          CERTUM_CERT_THUMBPRINT: ${{ steps.certum.outputs.thumbprint }}
+        run: >-
+          ./tools/windows-signing/sign-runtime.ps1
+          -Path dist/zhiyuan-sidecar/cc-connect-sidecar-windows-amd64.exe
+      - uses: actions/upload-artifact@v6
+        with:
+          name: signed-windows-sidecar
+          path: dist/zhiyuan-sidecar/cc-connect-sidecar-windows-amd64.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [build, sign-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: unsigned-sidecar-binaries
+          path: dist/zhiyuan-sidecar
+      - uses: actions/download-artifact@v8
+        with:
+          name: signed-windows-sidecar
+          path: dist/zhiyuan-sidecar
       - name: Generate immutable release metadata
         shell: bash
         run: |
           set -euo pipefail
           cd dist/zhiyuan-sidecar
+          chmod +x cc-connect-sidecar-darwin-* cc-connect-sidecar-linux-*
           sha256sum cc-connect-sidecar-* > checksums.txt
           jq -n \
             --arg tag "$GITHUB_REF_NAME" \
