@@ -22,7 +22,7 @@ if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024)
   throw new Error('Invalid signing manifest file.');
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 const build = await readBuildRun(key, manifest.sourceRunId);
-validateManifest(manifest, build, signingId, process.env.RUNTIME_SIGNER_THUMBPRINT);
+validateManifest(manifest, build, signingId);
 for (const file of manifest.files) {
   if (executableHash(directory, file.name) !== file.signedSha256)
     throw new Error('Signed executable hash mismatch.');
