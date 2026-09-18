@@ -1,31 +1,31 @@
 name: Release ZhiYuan sidecar
-
 on:
   push:
-    tags:
-      - 'zhiyuan-sidecar-v*'
-
+    tags: ['zhiyuan-sidecar-v*']
+  workflow_dispatch:
+    inputs:
+      signing_run_id:
+        description: Successful RongxinAI central signing run ID
+        type: string
+        required: true
 permissions:
-  contents: write
-
+  contents: read
 concurrency:
   group: zhiyuan-sidecar-release-${{ github.ref }}
   cancel-in-progress: false
-
 jobs:
-  release:
+  build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: Verify release source
+      - name: Verify tagged source belongs to main
         shell: bash
         run: |
           set -euo pipefail
@@ -33,57 +33,83 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           go test ./cmd/zhiyuan-sidecar
           bash tools/verify-zhiyuan-sidecar-boundary.sh
-
-      - name: Build platform binaries
+      - name: Build platform binaries without publishing
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist/zhiyuan-sidecar
           build() {
-            local goos="$1"
-            local goarch="$2"
-            local output="$3"
-            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags='-s -w' \
-                -o "dist/zhiyuan-sidecar/$output" ./cmd/zhiyuan-sidecar
+            GOOS="$1" GOARCH="$2" CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+              -o "dist/zhiyuan-sidecar/$3" ./cmd/zhiyuan-sidecar
           }
           build windows amd64 cc-connect-sidecar-windows-amd64.exe
           build darwin amd64 cc-connect-sidecar-darwin-amd64
           build darwin arm64 cc-connect-sidecar-darwin-arm64
           build linux amd64 cc-connect-sidecar-linux-amd64
-
-      - name: Generate immutable release metadata
-        shell: bash
+      - uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-sidecar-binaries
+          path: dist/zhiyuan-sidecar/cc-connect-sidecar-*
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      RUNTIME_ARTIFACT_READ_TOKEN: ${{ secrets.RUNTIME_ARTIFACT_READ_TOKEN }}
+      RUNTIME_SIGNER_THUMBPRINT: ${{ vars.RUNTIME_SIGNER_THUMBPRINT }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+      - uses: actions/download-artifact@v8
+        with:
+          repository: rongxinzy/RongxinAI
+          run-id: ${{ inputs.signing_run_id }}
+          name: signed-sidecar
+          path: signed-runtime
+          github-token: ${{ secrets.RUNTIME_ARTIFACT_READ_TOKEN }}
+      - name: Verify signing authority and original build provenance
+        id: source
+        shell: pwsh
+        env:
+          SIGNING_RUN_ID: ${{ inputs.signing_run_id }}
+        run: node tools/windows-signing/verify-return.mjs sidecar "$env:SIGNING_RUN_ID" signed-runtime
+      - name: Verify returned executable signature without cloud credentials
+        shell: pwsh
         run: |
-          set -euo pipefail
-          cd dist/zhiyuan-sidecar
-          sha256sum cc-connect-sidecar-* > checksums.txt
-          jq -n \
-            --arg tag "$GITHUB_REF_NAME" \
-            --arg revision "$GITHUB_SHA" \
-            --rawfile checksums checksums.txt \
-            '{
-              schemaVersion: 1,
-              sourceRepository: "https://github.com/rongxinzy/pi-connect",
-              tag: $tag,
-              sourceRevision: $revision,
-              sha256: (
-                $checksums
-                | split("\n")
-                | map(select(length > 0) | split("  "))
-                | map({key: .[1], value: .[0]})
-                | from_entries
-              )
-            }' > runtime-manifest.json
-
-      - name: Publish GitHub release
+          . ./tools/windows-signing/runtime-authenticode.ps1
+          Assert-WindowsRuntimeSignature -Path signed-runtime/cc-connect-sidecar-windows-amd64.exe `
+            -ExpectedThumbprint $env:RUNTIME_SIGNER_THUMBPRINT
+      - uses: actions/download-artifact@v8
+        with:
+          name: unsigned-sidecar-binaries
+          run-id: ${{ steps.source.outputs.run-id }}
+          path: dist/zhiyuan-sidecar
+          github-token: ${{ github.token }}
+      - name: Replace Windows bytes with centrally signed bytes
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath signed-runtime/cc-connect-sidecar-windows-amd64.exe -Destination dist/zhiyuan-sidecar/cc-connect-sidecar-windows-amd64.exe
+          Copy-Item -LiteralPath signed-runtime/signed-runtime-manifest.json -Destination dist/zhiyuan-sidecar/signed-runtime-manifest.json
+      - name: Generate checksums and publish from the original repository
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
-            dist/zhiyuan-sidecar/* \
-            --verify-tag \
-            --title "ZhiYuan sidecar ${GITHUB_REF_NAME#zhiyuan-sidecar-}" \
-            --generate-notes
+          cd dist/zhiyuan-sidecar
+          chmod +x cc-connect-sidecar-darwin-* cc-connect-sidecar-linux-*
+          sha256sum cc-connect-sidecar-* > checksums.txt
+          jq -n --arg tag "$SOURCE_TAG" --arg revision "$SOURCE_SHA" --rawfile checksums checksums.txt \
+            '{schemaVersion: 1, sourceRepository: "https://github.com/rongxinzy/pi-connect",
+              tag: $tag, sourceRevision: $revision, sha256: ($checksums | split("\n")
+              | map(select(length > 0) | split("  ")) | map({key: .[1], value: .[0]}) | from_entries)}' > runtime-manifest.json
+          gh release create "$SOURCE_TAG" ./* --repo rongxinzy/pi-connect --verify-tag --title "$SOURCE_TAG" --generate-notes

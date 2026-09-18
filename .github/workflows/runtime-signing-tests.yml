@@ -1,0 +1,27 @@
+name: Windows runtime signing policy
+on:
+  pull_request:
+    paths:
+      - 'tools/windows-signing/**'
+      - '.github/workflows/**'
+      - '.github/actions/setup-certum-signing/**'
+      - '.goreleaser.fork.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/windows-signing/**'
+      - '.github/workflows/**'
+      - '.github/actions/setup-certum-signing/**'
+      - '.goreleaser.fork.yaml'
+permissions:
+  contents: read
+jobs:
+  policy:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./tools/windows-signing
