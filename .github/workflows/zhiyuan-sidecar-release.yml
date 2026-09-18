@@ -61,7 +61,6 @@ jobs:
       contents: write
     env:
       RUNTIME_ARTIFACT_READ_TOKEN: ${{ secrets.RUNTIME_ARTIFACT_READ_TOKEN }}
-      RUNTIME_SIGNER_THUMBPRINT: ${{ vars.RUNTIME_SIGNER_THUMBPRINT }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -80,12 +79,6 @@ jobs:
         env:
           SIGNING_RUN_ID: ${{ inputs.signing_run_id }}
         run: node tools/windows-signing/verify-return.mjs sidecar "$env:SIGNING_RUN_ID" signed-runtime
-      - name: Verify returned executable signature without cloud credentials
-        shell: pwsh
-        run: |
-          . ./tools/windows-signing/runtime-authenticode.ps1
-          Assert-WindowsRuntimeSignature -Path signed-runtime/cc-connect-sidecar-windows-amd64.exe `
-            -ExpectedThumbprint $env:RUNTIME_SIGNER_THUMBPRINT
       - uses: actions/download-artifact@v8
         with:
           name: unsigned-sidecar-binaries

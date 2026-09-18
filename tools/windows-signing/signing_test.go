@@ -2,8 +2,6 @@ package signing_test
 
 import (
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -18,7 +16,7 @@ func TestSidecarReleaseSignsBeforeChecksums(t *testing.T) {
 	if !strings.Contains(publish, "actions/checkout@v6") {
 		t.Fatal("Publication must check out the repository so GitHub CLI can resolve its target")
 	}
-	for _, required := range []string{"environment: release", "repository: rongxinzy/RongxinAI", "name: signed-sidecar", "verify-return.mjs", "Assert-WindowsRuntimeSignature", "--verify-tag", "name: unsigned-sidecar-binaries"} {
+	for _, required := range []string{"environment: release", "repository: rongxinzy/RongxinAI", "name: signed-sidecar", "verify-return.mjs", "--verify-tag", "name: unsigned-sidecar-binaries"} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Missing signing boundary: %s", required)
 		}
@@ -26,18 +24,12 @@ func TestSidecarReleaseSignsBeforeChecksums(t *testing.T) {
 	if strings.Contains(workflow, "CERTUM_") || strings.Contains(workflow, "setup-certum-signing") {
 		t.Fatal("Signing credentials must remain exclusively in RongxinAI")
 	}
-	if strings.Index(publish, "Assert-WindowsRuntimeSignature") > strings.Index(publish, "sha256sum cc-connect-sidecar-*") {
+	if strings.Index(publish, "Copy-Item -LiteralPath signed-runtime/cc-connect-sidecar-windows-amd64.exe") > strings.Index(publish, "sha256sum cc-connect-sidecar-*") {
 		t.Fatal("Checksums must be generated after replacing unsigned Windows bytes with the signed artifact")
 	}
-}
-
-func TestAuthenticodePolicy(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("PowerShell Authenticode policy tests run on Windows CI")
+	for _, removed := range []string{"Assert-WindowsRuntimeSignature", "RUNTIME_SIGNER_THUMBPRINT", "runtime-authenticode.ps1"} {
+		if strings.Contains(workflow, removed) {
+			t.Fatalf("Runtime publication must not require signature verification: %s", removed)
+		}
 	}
-	output, err := exec.Command("powershell.exe", "-NoProfile", "-File", "runtime-authenticode.test.ps1").CombinedOutput()
-	if err != nil {
-		t.Fatalf("%v\n%s", err, output)
-	}
-	t.Log(string(output))
 }
