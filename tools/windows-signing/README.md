@@ -1,9 +1,23 @@
 # Windows runtime signing
 
-The release workflow authenticates with Certum SimplySign in the protected
-`release` environment. Configure `CERTUM_USER_ID`, `CERTUM_OTP_URI` (the complete
-TOTP URI), and `CERTUM_CERT_THUMBPRINT` as environment secrets. Do not copy these
-credentials into desktop application repositories or unprotected PR workflows.
+Certum credentials remain exclusively in RongxinAI's protected `release`
+environment. This repository must not configure Certum credentials or
+authenticate to SimplySign. Tagged builds only upload unsigned Actions
+artifacts. Final signed releases are published in this original repository.
+
+Configure `RUNTIME_ARTIFACT_READ_TOKEN` for Actions/read and Contents/read in
+RongxinAI and Contents/read in this repository. Configure the public
+`RUNTIME_SIGNER_THUMBPRINT` variable and protect the `release` environment.
+No cross-repository write permission or Certum secret is required here.
+
+After a successful tagged build, dispatch RongxinAI's central signing workflow
+from main with its build run ID. Then dispatch this repository's release
+workflow from main with the successful central `signing_run_id`.
+Publication verifies both workflow origins, main ancestry, unchanged tag,
+manifest identity/hashes and actual Authenticode before creating a release.
+Artifacts expire after 14 days; expired inputs require a new build/sign run.
+See the [central operational guide](https://github.com/rongxinzy/RongxinAI/blob/main/scripts/runtime-signing/README.md)
+for manual stages, least-privilege credentials and recovery details.
 
 Windows executables are signed with SHA-256 and an RFC 3161 timestamp before
 archives, release checksums, or SBOMs are generated. Signing and verification

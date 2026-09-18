@@ -18,12 +18,15 @@ func TestSidecarReleaseSignsBeforeChecksums(t *testing.T) {
 	if !strings.Contains(publish, "actions/checkout@v6") {
 		t.Fatal("Publication must check out the repository so GitHub CLI can resolve its target")
 	}
-	for _, required := range []string{"needs: [build, sign-windows]", "environment: release", "setup-certum-signing", "tools/windows-signing/sign-runtime.ps1", "name: signed-windows-sidecar"} {
+	for _, required := range []string{"environment: release", "repository: rongxinzy/RongxinAI", "name: signed-sidecar", "verify-return.mjs", "Assert-WindowsRuntimeSignature", "--verify-tag", "name: unsigned-sidecar-binaries"} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Missing signing boundary: %s", required)
 		}
 	}
-	if strings.LastIndex(workflow, "name: signed-windows-sidecar") > strings.Index(workflow, "sha256sum cc-connect-sidecar-*") {
+	if strings.Contains(workflow, "CERTUM_") || strings.Contains(workflow, "setup-certum-signing") {
+		t.Fatal("Signing credentials must remain exclusively in RongxinAI")
+	}
+	if strings.Index(publish, "Assert-WindowsRuntimeSignature") > strings.Index(publish, "sha256sum cc-connect-sidecar-*") {
 		t.Fatal("Checksums must be generated after replacing unsigned Windows bytes with the signed artifact")
 	}
 }
