@@ -98,11 +98,7 @@ jobs:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
+          node tools/windows-signing/prepare-sidecar-release.mjs dist/zhiyuan-sidecar "$SOURCE_TAG" "$SOURCE_SHA"
           cd dist/zhiyuan-sidecar
           chmod +x cc-connect-sidecar-darwin-* cc-connect-sidecar-linux-*
-          sha256sum cc-connect-sidecar-* > checksums.txt
-          jq -n --arg tag "$SOURCE_TAG" --arg revision "$SOURCE_SHA" --rawfile checksums checksums.txt \
-            '{schemaVersion: 1, sourceRepository: "https://github.com/rongxinzy/pi-connect",
-              tag: $tag, sourceRevision: $revision, sha256: ($checksums | split("\n")
-              | map(select(length > 0) | split("  ")) | map({key: .[1], value: .[0]}) | from_entries)}' > runtime-manifest.json
           gh release create "$SOURCE_TAG" ./* --repo rongxinzy/pi-connect --verify-tag --title "$SOURCE_TAG" --generate-notes
